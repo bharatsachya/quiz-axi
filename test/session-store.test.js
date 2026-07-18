@@ -102,16 +102,68 @@ test("finishGrading seals review_index as passed or failed", async () => {
   await withStore(async (store) => {
     await store.upsertSession("key1", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: QUIZ });
 
+    // "fail" has no completeness requirement - an incomplete review is itself a valid failure.
     await store.finishGrading("key1", { result: "fail", summary: "Not quite" });
     let record = await store.findReviewIndex("key1");
     assert.equal(record.status, "failed");
     assert.equal(record.passed, false);
     assert.ok(record.finished_at);
 
+    // Answer and grade every question before "pass" is allowed to succeed.
+    for (const question of QUIZ.questions) {
+      await store.queuePrompts("key1", {
+        prompts: [
+          {
+            uid: "",
+            prompt: "answer",
+            selector: "",
+            tag: "quiz-answer",
+            text: "",
+            target: { type: "quiz-answer", question_id: question.id, value: "x" },
+          },
+        ],
+      });
+      await store.gradeQuestion("key1", { questionId: question.id, verdict: "correct" });
+    }
+
     await store.finishGrading("key1", { result: "pass", summary: "Now correct" });
     record = await store.findReviewIndex("key1");
     assert.equal(record.status, "passed");
     assert.equal(record.passed, true);
+  });
+});
+
+test("finishGrading refuses to pass a session with unanswered or ungraded questions", async () => {
+  await withStore(async (store) => {
+    await store.upsertSession("key1", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: QUIZ });
+
+    // No questions answered at all.
+    await assert.rejects(() => store.finishGrading("key1", { result: "pass" }), /2 of 2 question\(s\)/);
+
+    // One answered and graded, one still missing.
+    await store.queuePrompts("key1", {
+      prompts: [
+        {
+          uid: "",
+          prompt: "answer",
+          selector: "",
+          tag: "quiz-answer",
+          text: "",
+          target: { type: "quiz-answer", question_id: "q1", choice_id: "a" },
+        },
+      ],
+    });
+    await store.gradeQuestion("key1", { questionId: "q1", verdict: "correct" });
+    await assert.rejects(() => store.finishGrading("key1", { result: "pass" }), /1 of 2 question\(s\)/);
+
+    // review_index must still show "pending" - the rejected attempt must not have sealed anything.
+    const record = await store.findReviewIndex("key1");
+    assert.equal(record.status, "pending");
+
+    // "fail" is unaffected by incompleteness - it's always allowed.
+    await store.finishGrading("key1", { result: "fail" });
+    const failedRecord = await store.findReviewIndex("key1");
+    assert.equal(failedRecord.status, "failed");
   });
 });
 

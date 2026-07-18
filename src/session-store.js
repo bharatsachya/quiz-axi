@@ -206,11 +206,33 @@ export class SessionStore {
 
   // Seals the review_index record `verify` reads - the only thing the husky pre-push gate
   // ever checks. `result` is "pass" or "fail".
+  //
+  // A "pass" requires every question to have been answered AND graded: otherwise an agent
+  // could call `--finish pass` the instant a session opens, before the human looked at
+  // anything, and the gate would wave the push through - defeating the entire point of the
+  // tool. "fail" has no such requirement, since an incomplete review is itself a valid reason
+  // to fail and ask the human to finish answering.
   async finishGrading(key, { result, summary }) {
     const state = await this.readState();
     const session = state.sessions[key];
     if (!session) {
       return null;
+    }
+    if (result === "pass") {
+      const totalQuestions = session.quiz?.questions?.length || 0;
+      const gradedCount = Object.values(session.answers || {}).filter(
+        (answer) => answer.verdict === "correct" || answer.verdict === "incorrect",
+      ).length;
+      if (gradedCount < totalQuestions) {
+        throw new AxiError(
+          `Cannot finish as "pass": ${totalQuestions - gradedCount} of ${totalQuestions} question(s) are still unanswered or ungraded.`,
+          "VALIDATION_ERROR",
+          [
+            "Grade every question with `grade <diff_key> --question <id> --verdict correct|incorrect` before finishing as pass.",
+            'Finish as "fail" instead if the review is genuinely incomplete and the human should come back to it.',
+          ],
+        );
+      }
     }
     const now = new Date().toISOString();
     if (summary) {
