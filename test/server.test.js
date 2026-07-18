@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -34,7 +34,7 @@ async function withServer(fn) {
   const server = await serve({ port: 0, stateFile, version: "test", idleTimeoutMs: null });
   const baseUrl = `http://127.0.0.1:${server.port}`;
   try {
-    await fn(baseUrl);
+    await fn(baseUrl, stateFile);
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
@@ -174,6 +174,34 @@ test("the diff renders as a GitHub-style split view: paired left/right cells wit
     assert.match(html, /split-cell split-right split-add"><span class="split-ln">2<\/span><span class="split-code">new line/);
     assert.match(html, /split-cell split-left split-empty/);
     assert.match(html, /split-cell split-right split-add"><span class="split-ln">3<\/span><span class="split-code">extra added line/);
+  });
+});
+
+test("a trivial (zero-question) quiz can be finished as pass immediately, with no grading at all", async () => {
+  await withServer(async (baseUrl, stateFile) => {
+    const key = "trivialkey1234567";
+    const trivialQuiz = { version: 3, significance: "trivial", diff_summary: "Renamed a variable", questions: [] };
+    const created = await postJson(`${baseUrl}/api/sessions`, {
+      key,
+      repo_root: "/repo",
+      diff_text: DIFF_TEXT,
+      diff_stat: {},
+      quiz: trivialQuiz,
+    });
+    assert.equal(created.status, 200);
+
+    const finished = await postJson(`${baseUrl}/api/${key}/grade`, { finish: "pass", summary: "trivial: rename" });
+    assert.equal(finished.status, 200);
+    assert.equal(finished.body.finished, "pass");
+    assert.deepEqual(finished.body.score, { answered: 0, correct: 0, total: 0 });
+
+    // The page still renders with zero questions - no crash from an empty questions array.
+    const pageRes = await fetch(`${baseUrl}/session/${key}`);
+    assert.equal(pageRes.status, 200);
+
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.equal(state.review_index[key].status, "passed");
+    assert.equal(state.review_index[key].passed, true);
   });
 });
 

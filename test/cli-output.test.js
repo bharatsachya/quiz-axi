@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { createPollOutput, createReviewOutput, verifyOneDiff } from "../src/cli.js";
+import { validateQuizSpec } from "../src/quiz.js";
 import { SessionStore } from "../src/session-store.js";
 
 test("createReviewOutput tells the agent to poll next, not respond to the user", () => {
@@ -98,6 +99,20 @@ test("verifyOneDiff: self-authored pass is allowed and reports method self-autho
     const result = await verifyOneDiff(store, "key1", "main");
     assert.equal(result.ok, true);
     assert.equal(result.method, "self-authored");
+  });
+});
+
+test("verifyOneDiff: end to end, a trivial quiz.json (significance trivial, no questions) clears the gate with no grading", async () => {
+  await withStore(async (store) => {
+    // The full chain the human's `git push` actually depends on: quiz.js accepts the trivial
+    // spec (commit 1), session-store seals it as passed with zero graded questions (commit 2),
+    // and verify - what `.husky/pre-push` really calls - reads that record straight off disk.
+    const quiz = validateQuizSpec({ version: 3, significance: "trivial", questions: [] });
+    await store.upsertSession("key1", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz });
+    await store.finishGrading("key1", { result: "pass", summary: "trivial: typo fix" });
+    const result = await verifyOneDiff(store, "key1", "main");
+    assert.equal(result.ok, true);
+    assert.equal(result.method, "quiz");
   });
 });
 

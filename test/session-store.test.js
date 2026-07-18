@@ -227,6 +227,22 @@ test("finishGrading refuses to pass a session with unanswered or ungraded questi
   });
 });
 
+test("finishGrading allows pass with zero graded questions when the quiz itself has zero questions (the trivial path)", async () => {
+  await withStore(async (store) => {
+    const trivialQuiz = { version: 3, significance: "trivial", diff_summary: "", questions: [] };
+    await store.upsertSession("key1", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: trivialQuiz });
+
+    // gradedCount(0) < totalQuestions(0) is false, so this was never actually blocked by the
+    // completeness check - the trivial path only needed quiz.json validation (src/quiz.js) to
+    // stop rejecting an empty questions array in the first place.
+    await store.finishGrading("key1", { result: "pass", summary: "trivial: rename a variable" });
+    const record = await store.findReviewIndex("key1");
+    assert.equal(record.status, "passed");
+    assert.equal(record.passed, true);
+    assert.deepEqual(record.score, { answered: 0, correct: 0, total: 0 });
+  });
+});
+
 test("endSession sets status and ended_by", async () => {
   await withStore(async (store) => {
     await store.upsertSession("key1", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: QUIZ });
