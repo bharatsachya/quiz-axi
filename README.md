@@ -23,37 +23,17 @@ Reviewing an AI-authored diff by skimming and clicking "looks good" doesn't buil
 
 ## How it works
 
-```
-┌──────────────────────┐
-│ Agent finishes a      │
-│ code change, writes    │
-│ a small quiz.json      │
-└──────────┬─────────────┘
-           ▼
-┌──────────────────────────┐
-│ quiz-axi review          │
-│ opens the diff + quiz    │
-│ in your browser          │
-└──────────┬────────────────┘
-           ▼
-┌──────────────────────────┐
-│ You read the diff,        │
-│ answer questions,         │
-│ ask your own back         │
-└──────────┬────────────────┘
-           ▼
-┌──────────────────────────┐
-│ Agent grades live via     │
-│ quiz-axi poll/grade       │
-│ → all correct = auto-pass │
-└──────────┬────────────────┘
-           ▼
-┌──────────────────────────┐
-│ .husky/pre-push runs      │
-│ quiz-axi verify           │
-│ → blocks git push unless  │
-│   this exact diff passed  │
-└──────────────────────────┘
+```mermaid
+flowchart TD
+    A["Agent finishes a change,<br/>writes a small quiz.json"] --> B["quiz-axi review<br/>opens the diff + quiz in your browser"]
+    B --> C["You read the diff,<br/>answer questions,<br/>ask your own back"]
+    C --> D["Agent grades live via<br/>quiz-axi poll / grade"]
+    D -- "asked a question" --> C
+    D -- "all answers correct" --> E["Review auto-passes,<br/>tab closes itself"]
+    E --> F["git push"]
+    F --> G{".husky/pre-push runs<br/>quiz-axi verify"}
+    G -- "this exact diff passed" --> H["push allowed"]
+    G -- "no matching pass on record" --> I["push blocked"]
 ```
 
 - **Content-addressed reviews** — a session is identified by a hash of the diff itself (not a commit SHA), computed the same way at review time and at push time. Edit the code again after passing and the diff changes, so the gate correctly asks for another look — that's not a bug, it's the whole point.
