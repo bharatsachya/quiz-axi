@@ -1,0 +1,26 @@
+{
+  "name": "quiz-axi",
+  "version": "0.1.0",
+  "description": "AXI that quizzes a human reviewer on an AI agent's diff, then gates git push on passing it.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "quiz-axi": "bin/quiz-axi.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node bin/quiz-axi.js",
+    "test": "node --test test/*.test.js",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "axi-sdk-js": "^0.1.8",
+    "express": "^5.2.1",
+    "open": "^10.2.0"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7"
+  }
+}
