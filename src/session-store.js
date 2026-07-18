@@ -96,17 +96,19 @@ export class SessionStore {
       .map((prompt) => ({ role: "user", text: prompt.prompt, at: new Date().toISOString() }));
 
     // Mirror quiz-answer prompts into session.answers immediately, so the browser/CLI can see
-    // what was answered even before an agent grades it via `grade --question`.
+    // what was answered even before an agent grades it via `grade --question`. A new answer
+    // always resets verdict/feedback/graded_at to null, even if this question was graded
+    // before: it's a fresh submission (e.g. a retry after an incorrect verdict) and must not
+    // inherit the previous answer's grade until it's actually re-graded.
     for (const prompt of normalizedPrompts) {
       if (prompt.tag === "quiz-answer" && prompt.target?.type === "quiz-answer" && prompt.target.question_id) {
         const questionId = prompt.target.question_id;
-        const previous = session.answers[questionId] || {};
         session.answers[questionId] = {
           value: prompt.target.choice_id ?? prompt.target.value ?? null,
           answered_at: new Date().toISOString(),
-          verdict: previous.verdict ?? null,
-          feedback: previous.feedback ?? null,
-          graded_at: previous.graded_at ?? null,
+          verdict: null,
+          feedback: null,
+          graded_at: null,
         };
       }
     }
@@ -133,14 +135,15 @@ export class SessionStore {
     }
     const prompts = session.prompts || [];
     const alreadyEnded = session.status === "ended";
+    const outcome = alreadyEnded ? state.review_index[key]?.status : undefined; // "passed" | "failed" | "pending"
     if (prompts.length === 0) {
-      return alreadyEnded ? { status: "ended", ended_by: session.ended_by } : { status: "waiting" };
+      return alreadyEnded ? { status: "ended", ended_by: session.ended_by, outcome } : { status: "waiting" };
     }
     const result = {
       status: "feedback",
       prompts,
       score: session.score,
-      ...(alreadyEnded ? { session_ended: true, ended_by: session.ended_by } : {}),
+      ...(alreadyEnded ? { session_ended: true, ended_by: session.ended_by, outcome } : {}),
     };
     session.prompts = [];
     session.pending_prompts = 0;
@@ -179,6 +182,12 @@ export class SessionStore {
 
   // Records the agent's live verdict for one already-answered question. Grading is always
   // agent-driven (never auto-graded, even for an objectively-correct multiple-choice pick).
+  //
+  // If this verdict makes every question correct, the session auto-finishes as "pass" and
+  // auto-ends right here, so the agent doesn't need a separate `--finish pass` + `end` step
+  // once the human has gotten everything right. Any question graded "incorrect" leaves the
+  // session open so the human can retry it (queuePrompts resets a question's verdict to null
+  // the moment it's re-answered, so a retry always needs fresh grading).
   async gradeQuestion(key, { questionId, verdict, feedback }) {
     const state = await this.readState();
     const session = state.sessions[key];
@@ -200,8 +209,17 @@ export class SessionStore {
     if (state.review_index[key]) {
       state.review_index[key] = { ...state.review_index[key], score: session.score, updated_at: now };
     }
+
+    let autoFinished = false;
+    if (session.score.total > 0 && session.score.correct === session.score.total) {
+      sealReviewIndex(state, session, key, "pass", now);
+      session.status = "ended";
+      session.ended_by = "agent";
+      autoFinished = true;
+    }
+
     await this.writeState(state);
-    return session;
+    return { session, autoFinished };
   }
 
   // Seals the review_index record `verify` reads - the only thing the husky pre-push gate
@@ -239,17 +257,21 @@ export class SessionStore {
       session.chat = [...(session.chat || []), { role: "agent", text: summary, at: now }];
     }
     session.updated_at = now;
-    state.review_index[key] = {
-      ...(state.review_index[key] || { repo_root: session.repo_root, session_key: key, created_at: now }),
-      status: result === "pass" ? "passed" : "failed",
-      passed: result === "pass",
-      score: session.score,
-      finished_at: now,
-      updated_at: now,
-    };
+    sealReviewIndex(state, session, key, result, now);
     await this.writeState(state);
     return session;
   }
+}
+
+function sealReviewIndex(state, session, key, result, now) {
+  state.review_index[key] = {
+    ...(state.review_index[key] || { repo_root: session.repo_root, session_key: key, created_at: now }),
+    status: result === "pass" ? "passed" : "failed",
+    passed: result === "pass",
+    score: session.score,
+    finished_at: now,
+    updated_at: now,
+  };
 }
 
 function computeScore(answers, quiz) {

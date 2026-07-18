@@ -86,7 +86,12 @@ test("gradeQuestion requires an existing answer, records verdict, updates score 
       ],
     });
 
-    const graded = await store.gradeQuestion("key1", { questionId: "q1", verdict: "correct", feedback: "Nice work" });
+    const { session: graded, autoFinished } = await store.gradeQuestion("key1", {
+      questionId: "q1",
+      verdict: "correct",
+      feedback: "Nice work",
+    });
+    assert.equal(autoFinished, false, "only one of two questions graded so far");
     assert.equal(graded.answers.q1.verdict, "correct");
     assert.deepEqual(graded.score, { answered: 1, correct: 1, total: 2 });
     assert.equal(graded.chat.at(-1).role, "agent");
@@ -95,6 +100,57 @@ test("gradeQuestion requires an existing answer, records verdict, updates score 
     const record = await store.findReviewIndex("key1");
     assert.deepEqual(record.score, { answered: 1, correct: 1, total: 2 });
     assert.equal(record.status, "pending");
+  });
+});
+
+test("gradeQuestion auto-finishes as passed and auto-ends once every question is correct", async () => {
+  await withStore(async (store) => {
+    await store.upsertSession("key1", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: QUIZ });
+
+    await store.queuePrompts("key1", {
+      prompts: [{ uid: "", prompt: "a", selector: "", tag: "quiz-answer", text: "", target: { type: "quiz-answer", question_id: "q1", choice_id: "a" } }],
+    });
+    const first = await store.gradeQuestion("key1", { questionId: "q1", verdict: "correct" });
+    assert.equal(first.autoFinished, false, "only one of two questions graded so far");
+    assert.notEqual(first.session.status, "ended");
+
+    await store.queuePrompts("key1", {
+      prompts: [{ uid: "", prompt: "b", selector: "", tag: "quiz-answer", text: "", target: { type: "quiz-answer", question_id: "q2", value: "x" } }],
+    });
+    const second = await store.gradeQuestion("key1", { questionId: "q2", verdict: "correct" });
+    assert.equal(second.autoFinished, true, "the last question graded correct should auto-finish");
+    assert.equal(second.session.status, "ended");
+    assert.equal(second.session.ended_by, "agent");
+
+    const record = await store.findReviewIndex("key1");
+    assert.equal(record.status, "passed");
+    assert.equal(record.passed, true);
+  });
+});
+
+test("an incorrect verdict does not auto-finish, and re-answering resets the stale verdict so a retry needs fresh grading", async () => {
+  await withStore(async (store) => {
+    await store.upsertSession("key1", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: QUIZ });
+
+    await store.queuePrompts("key1", {
+      prompts: [{ uid: "", prompt: "wrong", selector: "", tag: "quiz-answer", text: "", target: { type: "quiz-answer", question_id: "q1", choice_id: "b" } }],
+    });
+    const graded = await store.gradeQuestion("key1", { questionId: "q1", verdict: "incorrect", feedback: "Not quite" });
+    assert.equal(graded.autoFinished, false);
+    assert.equal(graded.session.answers.q1.verdict, "incorrect");
+
+    // Human retries with a different answer - the stale "incorrect" verdict must reset to null,
+    // not linger on the new, ungraded answer.
+    await store.queuePrompts("key1", {
+      prompts: [{ uid: "", prompt: "retry", selector: "", tag: "quiz-answer", text: "", target: { type: "quiz-answer", question_id: "q1", choice_id: "a" } }],
+    });
+    const midSession = await store.findByKey("key1");
+    assert.equal(midSession.answers.q1.verdict, null);
+    assert.equal(midSession.answers.q1.value, "a");
+
+    const regraded = await store.gradeQuestion("key1", { questionId: "q1", verdict: "correct" });
+    assert.equal(regraded.autoFinished, false, "q2 is still ungraded");
+    assert.equal(regraded.session.answers.q1.verdict, "correct");
   });
 });
 
@@ -109,7 +165,8 @@ test("finishGrading seals review_index as passed or failed", async () => {
     assert.equal(record.passed, false);
     assert.ok(record.finished_at);
 
-    // Answer and grade every question before "pass" is allowed to succeed.
+    // Answer and grade every question correct - the last gradeQuestion call auto-finishes as
+    // passed, flipping review_index back from "failed" to "passed".
     for (const question of QUIZ.questions) {
       await store.queuePrompts("key1", {
         prompts: [
@@ -125,8 +182,11 @@ test("finishGrading seals review_index as passed or failed", async () => {
       });
       await store.gradeQuestion("key1", { questionId: question.id, verdict: "correct" });
     }
+    record = await store.findReviewIndex("key1");
+    assert.equal(record.status, "passed");
 
-    await store.finishGrading("key1", { result: "pass", summary: "Now correct" });
+    // Calling finishGrading("pass") again afterward is a harmless idempotent re-seal.
+    await store.finishGrading("key1", { result: "pass", summary: "Confirmed" });
     record = await store.findReviewIndex("key1");
     assert.equal(record.status, "passed");
     assert.equal(record.passed, true);

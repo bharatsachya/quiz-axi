@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, openSync, readFileSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readFileSync, statSync } from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { AxiError, installSessionStartHooks, runAxiCli } from "axi-sdk-js";
@@ -26,7 +27,26 @@ export const POLL_WAKE_PATH_RULES = Object.freeze([
 const CODEX_POLL_WAKE_PATH_GUIDANCE =
   "Codex detected: completed background tasks may not resume Codex automatically, so keep the poll attached to the active turn.";
 
-export const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+// There is no build step (quiz-axi runs unbundled from src/), so package.json's version alone
+// never changes while iterating on source. `ensureServer()` only restarts an already-running
+// detached server on a version mismatch, so without this, editing server.js while the old
+// server is still up silently keeps serving the OLD in-memory code indefinitely. Folding in the
+// latest mtime across src/+bin/ makes every source edit change VERSION, so the next CLI
+// invocation always detects the mismatch and restarts the stale server automatically.
+function computeSourceFingerprint() {
+  let latestMtimeMs = 0;
+  for (const dirUrl of [new URL("../src", import.meta.url), new URL("../bin", import.meta.url)]) {
+    const dir = fileURLToPath(dirUrl);
+    for (const entry of readdirSync(dir)) {
+      if (!entry.endsWith(".js") && !entry.endsWith(".css")) continue;
+      const mtimeMs = statSync(path.join(dir, entry)).mtimeMs;
+      if (mtimeMs > latestMtimeMs) latestMtimeMs = mtimeMs;
+    }
+  }
+  return Math.round(latestMtimeMs).toString(36);
+}
+
+export const VERSION = `${JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version}+${computeSourceFingerprint()}`;
 
 export function detectInvokingAgent(env = process.env) {
   return ["CODEX_SANDBOX", "CODEX_THREAD_ID"].some((key) => Object.hasOwn(env, key)) ? "codex" : "generic";
@@ -235,13 +255,13 @@ export function createPollOutput({ diffKey: key, response, agent = "generic" }) 
         ...(sessionEnded ? { session_ended: true, ...(endedBy ? { ended_by: endedBy } : {}) } : {}),
       },
       prompts: response.prompts || [],
-      next_step: createFeedbackNextStep(key, sessionEnded, endedBy, response.prompts || [], agent),
+      next_step: createFeedbackNextStep(key, sessionEnded, endedBy, response.prompts || [], agent, response.outcome),
     };
   }
   if (response.status === "ended") {
     return {
       session: { diff_key: key, status: "ended", ...(response.ended_by ? { ended_by: response.ended_by } : {}) },
-      next_step: createEndedNextStep(key, response.ended_by),
+      next_step: createEndedNextStep(key, response.ended_by, response.outcome),
     };
   }
   return {
@@ -250,7 +270,7 @@ export function createPollOutput({ diffKey: key, response, agent = "generic" }) 
   };
 }
 
-function createFeedbackNextStep(key, sessionEnded, endedBy, prompts, agent) {
+function createFeedbackNextStep(key, sessionEnded, endedBy, prompts, agent, outcome) {
   const hasAnswers = prompts.some((prompt) => prompt.tag === "quiz-answer");
   const hasQuestions = prompts.some((prompt) => prompt.tag === "message");
   const parts = [];
@@ -273,10 +293,7 @@ function createFeedbackNextStep(key, sessionEnded, endedBy, prompts, agent) {
         ? `This was the last activity before the human ended the session. Stop polling ${key}.`
         : `This was the last activity before the session ended. Stop polling ${key}.`,
     );
-    parts.push(
-      `If the review was never finished, still run \`quiz-axi grade ${key} --finish pass|fail\` so \`quiz-axi ` +
-        `verify\` has a record before the human tries to push.`,
-    );
+    parts.push(finishReminder(key, outcome));
     return parts.join(" ");
   }
   parts.push(
@@ -286,12 +303,32 @@ function createFeedbackNextStep(key, sessionEnded, endedBy, prompts, agent) {
   return parts.join(" ");
 }
 
-function createEndedNextStep(key, endedBy) {
+function createEndedNextStep(key, endedBy, outcome) {
   const base =
     endedBy === "user"
       ? `The human ended this quiz-axi review session. Stop polling ${key}.`
       : `This quiz-axi review session for ${key} has ended. Stop polling.`;
-  return `${base} If you never finished grading, run \`quiz-axi grade ${key} --finish pass|fail\` so \`quiz-axi verify\` has a record before the human tries to push.`;
+  return `${base} ${finishReminder(key, outcome)}`;
+}
+
+// Grading the last question correct auto-finishes the review as passed and auto-ends the
+// session (see SessionStore.gradeQuestion) - the browser even shows a "review passed, you can
+// close this tab" screen on its own. Only tell the agent to run `--finish` when that did NOT
+// already happen, so a successful auto-finish doesn't get a spurious "you forgot a step" nudge.
+function finishReminder(key, outcome) {
+  if (outcome === "passed") {
+    return (
+      `The review already auto-finished as PASSED (every question was answered and graded correct) - the diff ` +
+      `is clear to push. Nothing further to run here.`
+    );
+  }
+  if (outcome === "failed") {
+    return `This review is already sealed as FAILED. Re-review with \`quiz-axi review\` once the human is ready to try again.`;
+  }
+  return (
+    `If the review was never finished, still run \`quiz-axi grade ${key} --finish pass|fail\` so \`quiz-axi ` +
+    `verify\` has a record before the human tries to push.`
+  );
 }
 
 async function gradeCommand(args) {

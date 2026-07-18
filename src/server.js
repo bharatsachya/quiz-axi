@@ -202,7 +202,7 @@ export async function serve({
         res.status(400).json({ error: "question_id and verdict (correct|incorrect) are required" });
         return;
       }
-      const session = await store.gradeQuestion(req.params.key, {
+      const { session, autoFinished } = await store.gradeQuestion(req.params.key, {
         questionId,
         verdict,
         feedback: String(body.feedback || ""),
@@ -213,7 +213,12 @@ export async function serve({
       }
       if (body.feedback) events.emit("agent-reply", req.params.key, String(body.feedback));
       events.emit("grade-sync", req.params.key, { question_id: questionId, verdict, score: session.score });
-      res.json({ status: "ok", question_id: questionId, verdict, score: session.score });
+      if (autoFinished) {
+        clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+        events.emit("ended", req.params.key, { ended_by: "agent", outcome: "passed" });
+      }
+      res.json({ status: "ok", question_id: questionId, verdict, score: session.score, auto_finished: autoFinished });
+      if (autoFinished) await shutdownIfNoLiveSessions();
     } catch (error) {
       if (error?.code === "VALIDATION_ERROR") {
         res.status(400).json({ error: error.message });
@@ -242,7 +247,7 @@ export async function serve({
     try {
       await store.endSession(req.params.key, "user");
       clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
-      events.emit("ended", req.params.key);
+      events.emit("ended", req.params.key, { ended_by: "user", outcome: await reviewOutcome(store, req.params.key) });
       res.json({ status: "ended" });
       await shutdownIfNoLiveSessions();
     } catch (error) {
@@ -255,7 +260,7 @@ export async function serve({
       const key = String(req.body.key || "");
       await store.endSession(key, "agent");
       clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
-      events.emit("ended", key);
+      events.emit("ended", key, { ended_by: "agent", outcome: await reviewOutcome(store, key) });
       res.json({ status: "ended" });
       await shutdownIfNoLiveSessions();
     } catch (error) {
@@ -301,18 +306,28 @@ export async function serve({
           res.write(`event: grade-sync\ndata: ${JSON.stringify(payload)}\n\n`);
         }
       };
+      const sendEnded = (key, payload) => {
+        if (key === req.params.key) {
+          res.write(`event: ended\ndata: ${JSON.stringify(payload || {})}\n\n`);
+        }
+      };
       res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);
       res.write(
         `event: agent-presence\ndata: ${JSON.stringify({ state: computePresence(req.params.key, activePolls, deliveredFeedback) })}\n\n`,
       );
+      if (session?.status === "ended") {
+        res.write(`event: ended\ndata: ${JSON.stringify({ ended_by: session.ended_by, outcome: await reviewOutcome(store, req.params.key) })}\n\n`);
+      }
       events.on("agent-reply", sendAgentReply);
       events.on("agent-presence", sendPresence);
       events.on("grade-sync", sendGradeSync);
+      events.on("ended", sendEnded);
       req.on("close", () => {
         sseClients.delete(res);
         events.off("agent-reply", sendAgentReply);
         events.off("agent-presence", sendPresence);
         events.off("grade-sync", sendGradeSync);
+        events.off("ended", sendEnded);
         refreshIdleTimer();
       });
     } catch (error) {
@@ -449,18 +464,30 @@ export function computePresence(key, activePolls, deliveredFeedback) {
   return "waiting";
 }
 
+// Whatever review_index says right now, so any path to "ended" (auto-finish, or the agent's
+// explicit finish+end) reports a consistent outcome to the browser's `ended` SSE event.
+async function reviewOutcome(store, key) {
+  const record = await store.findReviewIndex(key);
+  if (record?.status === "passed") return "passed";
+  if (record?.status === "failed") return "failed";
+  return undefined;
+}
+
 const MORE_ICON =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="19" r="1.4"/></svg>';
 
 // Diff text has no `diff --git` header before the first hunk if the input is empty/malformed;
 // callers only ever pass server-computed diff text, so that's the only defensive case here.
+// Tracks old-side AND new-side line numbers per line (not just the new side) so the split
+// (side-by-side) view below can show a correct gutter number on both columns.
 function parseDiffForDisplay(diffText) {
   const files = [];
   let currentFile = null;
   let currentHunk = null;
+  let oldLineNo = 0;
   let newLineNo = 0;
   const fileHeaderRe = /^diff --git a\/(.+) b\/(.+)$/;
-  const hunkHeaderRe = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+  const hunkHeaderRe = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
   for (const line of String(diffText || "").split("\n")) {
     const fileMatch = fileHeaderRe.exec(line);
     if (fileMatch) {
@@ -472,10 +499,16 @@ function parseDiffForDisplay(diffText) {
     if (!currentFile) continue;
     const hunkMatch = hunkHeaderRe.exec(line);
     if (hunkMatch) {
-      const start = Number(hunkMatch[1]);
-      const count = hunkMatch[2] !== undefined ? Number(hunkMatch[2]) : 1;
-      newLineNo = start;
-      currentHunk = { header: line, startLine: start, endLine: count > 0 ? start + count - 1 : start, lines: [] };
+      oldLineNo = Number(hunkMatch[1]);
+      const newStart = Number(hunkMatch[2]);
+      const newCount = hunkMatch[3] !== undefined ? Number(hunkMatch[3]) : 1;
+      newLineNo = newStart;
+      currentHunk = {
+        header: line,
+        startLine: newStart,
+        endLine: newCount > 0 ? newStart + newCount - 1 : newStart,
+        lines: [],
+      };
       currentFile.hunks.push(currentHunk);
       continue;
     }
@@ -483,22 +516,63 @@ function parseDiffForDisplay(diffText) {
     if (line.startsWith("+++") || line.startsWith("---")) continue;
     if (line.startsWith("\\")) continue;
     if (line.startsWith("+")) {
-      currentHunk.lines.push({ type: "add", text: line.slice(1), lineNo: newLineNo });
+      currentHunk.lines.push({ type: "add", text: line.slice(1), oldLineNo: null, newLineNo });
       newLineNo += 1;
     } else if (line.startsWith("-")) {
-      currentHunk.lines.push({ type: "del", text: line.slice(1), lineNo: null });
+      currentHunk.lines.push({ type: "del", text: line.slice(1), oldLineNo, newLineNo: null });
+      oldLineNo += 1;
     } else if (line.startsWith(" ")) {
-      currentHunk.lines.push({ type: "ctx", text: line.slice(1), lineNo: newLineNo });
+      currentHunk.lines.push({ type: "ctx", text: line.slice(1), oldLineNo, newLineNo });
+      oldLineNo += 1;
       newLineNo += 1;
     }
   }
   return files;
 }
 
-function renderDiffLine(line) {
-  const cls = line.type === "add" ? "diff-line-add" : line.type === "del" ? "diff-line-del" : "diff-line-ctx";
-  const marker = line.type === "add" ? "+" : line.type === "del" ? "-" : " ";
-  return `<span class="diff-line ${cls}">${marker}${escapeHtml(line.text)}</span>`;
+// Pairs up a hunk's flat line list into left(old)/right(new) rows for a GitHub-style split
+// view: context lines show the same content on both sides; a run of deletions immediately
+// followed by a run of additions (the common "changed these lines" shape) pairs up
+// positionally, left over lines on the longer side get an empty cell on the other side.
+function buildSplitRows(lines) {
+  const rows = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.type === "ctx") {
+      rows.push({ left: line, right: line });
+      i += 1;
+      continue;
+    }
+    const dels = [];
+    while (i < lines.length && lines[i].type === "del") {
+      dels.push(lines[i]);
+      i += 1;
+    }
+    const adds = [];
+    while (i < lines.length && lines[i].type === "add") {
+      adds.push(lines[i]);
+      i += 1;
+    }
+    const max = Math.max(dels.length, adds.length);
+    for (let j = 0; j < max; j += 1) {
+      rows.push({ left: dels[j] || null, right: adds[j] || null });
+    }
+  }
+  return rows;
+}
+
+function renderSplitCell(line, side) {
+  if (!line) {
+    return `<div class="split-cell split-${side} split-empty"></div>`;
+  }
+  const cls = line.type === "add" ? "split-add" : line.type === "del" ? "split-del" : "split-ctx";
+  const lineNo = side === "left" ? line.oldLineNo : line.newLineNo;
+  return `<div class="split-cell split-${side} ${cls}"><span class="split-ln">${lineNo ?? ""}</span><span class="split-code">${escapeHtml(line.text)}</span></div>`;
+}
+
+function renderSplitRow(row) {
+  return renderSplitCell(row.left, "left") + renderSplitCell(row.right, "right");
 }
 
 function renderQuestionCard(question) {
@@ -533,9 +607,8 @@ function renderDiffHtml(diffText, questions) {
     const fileQuestions = anchoredByFile.get(file.file) || [];
     const placed = new Set();
     for (const hunk of file.hunks) {
-      html += `<pre class="diff-hunk"><span class="diff-hunk-header">${escapeHtml(hunk.header)}</span>\n${hunk.lines
-        .map(renderDiffLine)
-        .join("\n")}</pre>`;
+      const rows = buildSplitRows(hunk.lines);
+      html += `<div class="diff-hunk-split"><div class="split-hunk-header">${escapeHtml(hunk.header)}</div>${rows.map(renderSplitRow).join("")}</div>`;
       const matched = fileQuestions.filter(
         (question) =>
           !placed.has(question.id) &&
@@ -576,7 +649,7 @@ export function createChromeHtml(session, { title = "Quiz Review" } = {}) {
 <body class="quiz">
 <div class="bar"><div class="brand"><span class="brand-mark">Quiz</span><span class="brand-support">AXI</span></div><div class="spacer" aria-hidden="true"></div><div class="score-readout" id="scoreReadout">Score: ${score.correct}/${score.total}</div><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${MORE_ICON}</button><div class="menu more-menu" id="moreMenu" hidden><button class="menu-item" id="copyDiff" type="button">Copy diff</button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">End session</button></div></div></div>
 <div class="layout"><div class="frame"><div class="diff-meta">${summary}<p class="diff-stat">${stat.files_changed} file(s) changed, +${stat.insertions} -${stat.deletions}</p></div><div class="diff-view" id="diffView">${diffHtml}</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from quiz-axi.</div><textarea id="chatInput" placeholder="Ask a question about this change..."></textarea><div class="send-hint" id="sendHint" hidden>Write a question first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">Send &amp; End</button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
-<div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div></div></div>
+<div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card" id="endedCard"><div class="ended-title" id="endedTitle">Session ended.</div><p class="ended-copy" id="endedCopy">Return to your agent to continue.</p></div></div>
 <script id="quiz-session" type="application/json">${sessionJson}</script>
 <script id="diff-raw" type="text/plain">${escapeHtml(session.diff_text || "")}</script>
 <script src="/chrome-client.js"></script>

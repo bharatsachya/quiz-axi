@@ -20,6 +20,9 @@ const endButton = document.getElementById("end");
 const presenceBanner = document.getElementById("presenceBanner");
 const sendHint = document.getElementById("sendHint");
 const endedOverlay = document.getElementById("endedOverlay");
+const endedCard = document.getElementById("endedCard");
+const endedTitle = document.getElementById("endedTitle");
+const endedCopy = document.getElementById("endedCopy");
 const scoreReadout = document.getElementById("scoreReadout");
 const diffView = document.getElementById("diffView");
 const diffRawEl = document.getElementById("diff-raw");
@@ -279,7 +282,7 @@ async function endSession() {
   markSessionEnded();
 }
 
-function markSessionEnded() {
+function markSessionEnded({ outcome } = {}) {
   if (ended) return;
   ended = true;
   closeMenus();
@@ -287,7 +290,41 @@ function markSessionEnded() {
   chatInput.disabled = true;
   updateSendState();
   if (presenceBanner) presenceBanner.hidden = true;
+  applyEndedMessage(outcome);
   endedOverlay.hidden = false;
+  attemptAutoClose(outcome);
+}
+
+function applyEndedMessage(outcome) {
+  if (!endedTitle || !endedCopy || !endedCard) return;
+  endedCard.classList.remove("outcome-passed", "outcome-failed");
+  if (outcome === "passed") {
+    endedCard.classList.add("outcome-passed");
+    endedTitle.textContent = "All correct! Review passed.";
+    endedCopy.textContent = "This diff is now clear to push. You can close this tab and return to your terminal.";
+  } else if (outcome === "failed") {
+    endedCard.classList.add("outcome-failed");
+    endedTitle.textContent = "Review marked failed.";
+    endedCopy.textContent = "See your agent's notes in the conversation panel, or in your terminal. You can close this tab.";
+  } else {
+    endedTitle.textContent = "Session ended.";
+    endedCopy.textContent = "Return to your agent to continue.";
+  }
+}
+
+function attemptAutoClose(outcome) {
+  if (outcome !== "passed") return;
+  // Browsers only allow script-initiated close on tabs opened by script; a tab opened via the
+  // OS `open` command (how `quiz-axi review` launches the browser) usually is NOT one of
+  // those, so this best-effort attempt silently no-ops in most browsers - the visible message
+  // above (and "you can close this tab") is the real fallback, not this call.
+  setTimeout(() => {
+    try {
+      window.close();
+    } catch {
+      // ignored - the ended overlay's message is the fallback
+    }
+  }, 1200);
 }
 
 function copyDiffText() {
@@ -298,6 +335,12 @@ function copyDiffText() {
 function lockCard(card) {
   for (const el of card.querySelectorAll("input, textarea, button.question-submit")) {
     el.disabled = true;
+  }
+}
+
+function unlockCard(card) {
+  for (const el of card.querySelectorAll("input, textarea, button.question-submit")) {
+    el.disabled = false;
   }
 }
 
@@ -362,8 +405,14 @@ function applyGradeSync(payload) {
     const selector = '.question-card[data-question-id="' + CSS.escape(payload.question_id) + '"]';
     const card = diffView.querySelector(selector);
     if (card) {
-      lockCard(card);
-      setCardBadge(card, payload.verdict === "correct" ? "correct" : "incorrect", payload.verdict === "correct" ? "Correct" : "Needs another look");
+      if (payload.verdict === "correct") {
+        lockCard(card);
+        setCardBadge(card, "correct", "Correct");
+      } else {
+        // Re-enable so the human can retry - see the agent's feedback in the chat panel first.
+        unlockCard(card);
+        setCardBadge(card, "incorrect", "Not quite - see feedback below, then try again");
+      }
     }
   }
 }
@@ -408,3 +457,4 @@ events.addEventListener("agent-reply", (event) => addChat("agent", JSON.parse(ev
 events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
 events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
 events.addEventListener("grade-sync", (event) => applyGradeSync(JSON.parse(event.data)));
+events.addEventListener("ended", (event) => markSessionEnded(JSON.parse(event.data)));

@@ -56,7 +56,7 @@ test("health check reports the app name and version", async () => {
   });
 });
 
-test("session lifecycle: create, poll (immediate waiting), submit answer, poll delivers it, grade, finish", async () => {
+test("session lifecycle: create, poll (immediate waiting), submit answer, poll delivers it", async () => {
   await withServer(async (baseUrl) => {
     const key = "testkey1234567890";
     const created = await postJson(`${baseUrl}/api/sessions`, {
@@ -97,28 +97,92 @@ test("session lifecycle: create, poll (immediate waiting), submit answer, poll d
     assert.equal(feedback.status, "feedback");
     assert.equal(feedback.prompts.length, 1);
     assert.equal(feedback.prompts[0].target.question_id, "q1");
+  });
+});
 
-    // Grade it.
+test("grading the only question correct auto-finishes the review and resolves an in-flight poll as passed", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "autofinishkey1234";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: QUIZ });
+    await postJson(`${baseUrl}/api/${key}/prompts`, {
+      prompts: [
+        {
+          uid: "",
+          prompt: "Answered: Flaky network",
+          selector: "",
+          tag: "quiz-answer",
+          text: "",
+          target: { type: "quiz-answer", question_id: "q1", choice_id: "a" },
+        },
+      ],
+    });
+
+    // Drain the queued answer with a bounded poll first, so the long poll started below has
+    // nothing queued and genuinely waits (an immediate `takeFeedback` hit would otherwise
+    // resolve it right away with the already-queued answer, never reaching the wait branch).
+    const drained = await fetch(`${baseUrl}/api/poll?key=${key}&timeoutMs=50`).then((res) => res.json());
+    assert.equal(drained.status, "feedback");
+
+    // Now the long poll genuinely waits - keeping it attached also stops the server's "no live
+    // connections" self-shutdown from firing the instant this grade call auto-ends the session.
+    const pollPromise = fetch(`${baseUrl}/api/poll?key=${key}`).then((res) => res.json());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
     const graded = await postJson(`${baseUrl}/api/${key}/grade`, { question_id: "q1", verdict: "correct", feedback: "Exactly right." });
     assert.equal(graded.status, 200);
+    assert.equal(graded.body.auto_finished, true);
     assert.deepEqual(graded.body.score, { answered: 1, correct: 1, total: 1 });
 
-    // Grading before an answer exists should 400, not 500.
-    const badGrade = await postJson(`${baseUrl}/api/${key}/grade`, { question_id: "nonexistent", verdict: "correct" });
-    assert.equal(badGrade.status, 400);
+    const poll = await pollPromise;
+    assert.equal(poll.status, "ended");
+    assert.equal(poll.ended_by, "agent");
+    assert.equal(poll.outcome, "passed");
 
-    // Finish the review.
-    const finished = await postJson(`${baseUrl}/api/${key}/grade`, { finish: "pass", summary: "All good." });
-    assert.equal(finished.status, 200);
-    assert.equal(finished.body.finished, "pass");
-
-    // The session page renders the diff and the question card.
+    // The session page still renders with the final score after auto-finish.
     const pageRes = await fetch(`${baseUrl}/session/${key}`);
     const html = await pageRes.text();
     assert.equal(pageRes.status, 200);
     assert.match(html, /question-card/);
     assert.match(html, /added line/);
     assert.match(html, /Score: 1\/1/);
+  });
+});
+
+test("the diff renders as a GitHub-style split view: paired left/right cells with independent line numbers", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "splitviewkey12345";
+    const diffText = [
+      "diff --git a/f.js b/f.js",
+      "index 111..222 100644",
+      "--- a/f.js",
+      "+++ b/f.js",
+      "@@ -1,2 +1,3 @@",
+      " context",
+      "-old line",
+      "+new line",
+      "+extra added line",
+      "",
+    ].join("\n");
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: diffText, diff_stat: {}, quiz: { version: 1, questions: [] } });
+
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(html, /diff-hunk-split/);
+    // The unchanged context line appears on both sides.
+    assert.equal((html.match(/>context</g) || []).length, 2);
+    // The deletion appears only on the left, the two additions only on the right.
+    assert.match(html, /split-cell split-left split-del"><span class="split-ln">2<\/span><span class="split-code">old line/);
+    assert.match(html, /split-cell split-right split-add"><span class="split-ln">2<\/span><span class="split-code">new line/);
+    assert.match(html, /split-cell split-left split-empty/);
+    assert.match(html, /split-cell split-right split-add"><span class="split-ln">3<\/span><span class="split-code">extra added line/);
+  });
+});
+
+test("grading before an answer exists returns 400, not 500", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "badgradekey123456";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: QUIZ });
+    const badGrade = await postJson(`${baseUrl}/api/${key}/grade`, { question_id: "nonexistent", verdict: "correct" });
+    assert.equal(badGrade.status, 400);
   });
 });
 

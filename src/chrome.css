@@ -278,35 +278,74 @@ body {
   color: var(--fg-muted);
   word-break: break-all;
 }
-.diff-hunk {
+.diff-hunk-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   margin: 0;
-  padding: var(--space-4) 0;
-  overflow-x: auto;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: 1.5;
   background: var(--bg-panel);
 }
-.diff-hunk-header {
-  display: block;
+.split-hunk-header {
+  grid-column: 1 / -1;
   padding: 2px var(--space-6);
   color: var(--fg-label);
+  background: var(--bg-elevated);
 }
-.diff-line {
-  display: block;
-  padding: 0 var(--space-6);
+.split-cell {
+  display: flex;
+  min-width: 0;
+  overflow-x: auto;
   white-space: pre;
 }
-.diff-line-add {
+.split-cell.split-left {
+  border-right: var(--hairline-subtle);
+}
+.split-ln {
+  flex: 0 0 auto;
+  width: 36px;
+  padding: 0 6px;
+  text-align: right;
+  color: var(--fg-label);
+  user-select: none;
+  position: sticky;
+  left: 0;
+  background: inherit;
+}
+.split-code {
+  flex: 1 1 auto;
+  padding: 0 var(--space-6) 0 4px;
+}
+.split-add {
   background: rgba(143, 227, 158, 0.12);
+}
+.split-add .split-code {
   color: var(--sage-300);
 }
-.diff-line-del {
+.split-del {
   background: rgba(240, 100, 100, 0.1);
+}
+.split-del .split-code {
   color: var(--rust-500);
 }
-.diff-line-ctx {
+.split-ctx .split-code {
   color: var(--fg-dim);
+}
+.split-empty {
+  background: repeating-linear-gradient(45deg, var(--bg-elevated) 0, var(--bg-elevated) 4px, var(--bg-panel) 4px, var(--bg-panel) 8px);
+}
+@media (max-width: 640px) {
+  .diff-hunk-split {
+    grid-template-columns: 1fr;
+  }
+  .split-cell.split-left {
+    border-right: none;
+    border-bottom: var(--hairline-subtle);
+  }
+  .split-cell.split-empty {
+    display: none;
+  }
 }
 .questions-section {
   margin-top: var(--space-12);
@@ -614,6 +653,18 @@ body {
   font-size: 22px;
   line-height: 1.3;
   color: var(--fg);
+}
+.ended-card.outcome-passed .ended-title {
+  color: var(--sage-300);
+}
+.ended-card.outcome-failed .ended-title {
+  color: var(--rust-500);
+}
+.ended-copy {
+  margin: 10px 0 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: 1.5;
 }
 
 @media (max-width: 860px) {
