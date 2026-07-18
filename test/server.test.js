@@ -28,6 +28,29 @@ const DIFF_TEXT = ["diff --git a/f.js b/f.js", "index 111..222 100644", "--- a/f
   "\n",
 );
 
+const MULTI_HUNK_DIFF = [
+  "diff --git a/a.js b/a.js",
+  "index 111..222 100644",
+  "--- a/a.js",
+  "+++ a/a.js",
+  "@@ -1,1 +1,2 @@",
+  " context",
+  "+added in a",
+  "diff --git a/b.js b/b.js",
+  "index 333..444 100644",
+  "--- a/b.js",
+  "+++ a/b.js",
+  "@@ -1,1 +1,2 @@",
+  " context",
+  "+added in b",
+  "",
+].join("\n");
+
+function extractTour(html) {
+  const match = html.match(/<script id="quiz-session" type="application\/json">([\s\S]*?)<\/script>/);
+  return JSON.parse(match[1]).tour;
+}
+
 async function withServer(fn) {
   const dir = await mkdtemp(path.join(tmpdir(), "quiz-axi-server-"));
   const stateFile = path.join(dir, "state.json");
@@ -276,8 +299,174 @@ test("decisions render collapsed (details, not open) once there are more than 3"
     const quiz = { version: 3, questions: [], significance: "trivial", decisions };
     await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
     const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
-    assert.match(html, /<details class="decisions-block"><summary>Decisions \(4\)/);
-    assert.doesNotMatch(html, /<details class="decisions-block" open>/);
+    assert.match(html, /<details class="decisions-block" id="decisionsBlock"><summary>Decisions \(4\)/);
+    assert.doesNotMatch(html, /<details class="decisions-block" id="decisionsBlock" open>/);
+  });
+});
+
+test("guided tour: the shell renders, defaults to visible with full review hidden, and interleaves a matching question right after its walkthrough step", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "tourkey123456789ab";
+    const quiz = {
+      version: 3,
+      significance: "small",
+      questions: [
+        { id: "q1", type: "free-text", prompt: "?", hunk_anchor: { file: "f.js", start_line: 1, end_line: 2 }, anchor_matched: true },
+      ],
+      explainer: { summary: "x", walkthrough: [{ text: "Added a line.", hunk_anchor: { file: "f.js", start_line: 1, end_line: 2 } }] },
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(html, /id="tourMode"/);
+    assert.match(html, /id="tourToggle"/);
+    assert.match(html, /id="fullReview" hidden>/, "full review starts hidden - the tour is the default landing view");
+    assert.match(
+      html,
+      /"tour":\[\{"kind":"summary","label":"Summary","text":"x"},\{"kind":"walkthrough","label":"Step 1","text":"Added a line\.","hunk_dom_id":"hunk-0"},\{"kind":"checkpoint","label":"Checkpoint 1","question_id":"q1","hunk_dom_id":"hunk-0","hint_step_index":1},\{"kind":"grade","label":"Grade"}\]/,
+    );
+  });
+});
+
+test("guided tour: no shell at all for a trivial (zero-question, no explainer) quiz - nothing to tour", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "notrivialtourabcdef";
+    const quiz = { version: 3, significance: "trivial", questions: [] };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.doesNotMatch(html, /id="tourMode"/);
+    assert.doesNotMatch(html, /id="tourToggle"/);
+    assert.match(html, /id="fullReview">/, "no tour means full review renders visible, not hidden");
+    assert.match(html, /"tour":\[\]/);
+  });
+});
+
+test("guided tour: a v1 quiz.json with no explainer still gets a checkpoints-only tour of its unanchored question", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "unanchoredtourabcde";
+    const quiz = { version: 1, questions: [{ id: "q1", type: "free-text", prompt: "?" }] };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(
+      html,
+      /"tour":\[\{"kind":"checkpoint","label":"Checkpoint 1","question_id":"q1","hunk_dom_id":null},\{"kind":"grade","label":"Grade"}\]/,
+    );
+  });
+});
+
+test("guided tour decisions: <=3 decisions each get their own stop - referenced ones land right before the checkpoint that mentions their id, unreferenced ones after the last walkthrough step", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "decisionorderkey123";
+    const quiz = {
+      version: 3,
+      questions: [
+        { id: "q1", type: "free-text", prompt: "Why d1 over the alternative?", hunk_anchor: { file: "a.js", start_line: 1, end_line: 2 }, anchor_matched: true },
+        { id: "q2", type: "free-text", prompt: "What happens now?", hunk_anchor: { file: "b.js", start_line: 1, end_line: 2 }, anchor_matched: true },
+      ],
+      explainer: {
+        summary: "x",
+        walkthrough: [
+          { text: "Step one.", hunk_anchor: { file: "a.js", start_line: 1, end_line: 2 } },
+          { text: "Step two.", hunk_anchor: { file: "b.js", start_line: 1, end_line: 2 } },
+        ],
+      },
+      decisions: [
+        { id: "d1", who: "human", decision: "Use approach A", why: "reason", alternatives: ["B"] },
+        { id: "d2", who: "agent", decision: "Use approach C" },
+      ],
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: MULTI_HUNK_DIFF, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    const tour = extractTour(html);
+    assert.deepEqual(
+      tour.map((step) => step.kind + (step.decision_id ? ":" + step.decision_id : step.question_id ? ":" + step.question_id : "")),
+      ["summary", "walkthrough", "decision:d1", "checkpoint:q1", "walkthrough", "decision:d2", "checkpoint:q2", "grade"],
+    );
+    assert.equal(tour[2].who, "human");
+    assert.equal(tour[2].position, 1);
+    assert.equal(tour[2].total, 2);
+  });
+});
+
+test("guided tour decisions: more than 3 decisions render one grouped stop instead of individual ones", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "decisiongroupkey123";
+    const quiz = {
+      version: 3,
+      questions: [],
+      significance: "trivial",
+      decisions: Array.from({ length: 4 }, (_, i) => ({ id: `d${i}`, who: i % 2 === 0 ? "agent" : "human", decision: `Decision ${i}` })),
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    const tour = extractTour(html);
+    const groupStop = tour.find((step) => step.kind === "decisions-group");
+    assert.ok(groupStop, "expected a single grouped decisions stop");
+    assert.equal(groupStop.label, "Decisions (4)");
+    assert.equal(groupStop.decisions.length, 4);
+    assert.equal(tour.filter((step) => step.kind === "decision").length, 0, "no individual decision stops once grouped");
+  });
+});
+
+test("guided tour decisions: a decision with an unmatched hunk_anchor degrades gracefully, same as steps", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "decisionnomatchkey1";
+    const quiz = {
+      version: 3,
+      questions: [],
+      significance: "trivial",
+      decisions: [{ id: "d1", decision: "Something", hunk_anchor: { file: "nowhere.js", start_line: 1, end_line: 2 } }],
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const res = await fetch(`${baseUrl}/session/${key}`);
+    assert.equal(res.status, 200);
+    const tour = extractTour(await res.text());
+    const decisionStop = tour.find((step) => step.kind === "decision");
+    assert.equal(decisionStop.hunk_dom_id, null);
+  });
+});
+
+test("guided tour uncovered hunks: a hunk no walkthrough step anchors to gets its own stop listing exactly that hunk", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "uncoveredkey1234567";
+    const quiz = {
+      version: 3,
+      questions: [],
+      significance: "trivial",
+      explainer: { summary: "x", walkthrough: [{ text: "Only covers a.js.", hunk_anchor: { file: "a.js", start_line: 1, end_line: 2 } }] },
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: MULTI_HUNK_DIFF, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    const tour = extractTour(html);
+    const uncoveredStop = tour.find((step) => step.kind === "uncovered");
+    assert.ok(uncoveredStop, "expected an uncovered-hunks stop");
+    assert.equal(uncoveredStop.hunks.length, 1);
+    assert.equal(uncoveredStop.hunks[0].file, "b.js");
+    assert.equal(uncoveredStop.hunks[0].adds, 1);
+    // Right before Grade, and the total step count reflects it (progress denominator includes it).
+    assert.equal(tour.at(-1).kind, "grade");
+    assert.equal(tour.at(-2).kind, "uncovered");
+  });
+});
+
+test("guided tour uncovered hunks: a walkthrough that covers every hunk gets no uncovered stop at all", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "fullycoveredkey1234";
+    const quiz = {
+      version: 3,
+      questions: [],
+      significance: "trivial",
+      explainer: {
+        summary: "x",
+        walkthrough: [
+          { text: "Covers a.js.", hunk_anchor: { file: "a.js", start_line: 1, end_line: 2 } },
+          { text: "Covers b.js.", hunk_anchor: { file: "b.js", start_line: 1, end_line: 2 } },
+        ],
+      },
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: MULTI_HUNK_DIFF, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    const tour = extractTour(html);
+    assert.equal(tour.some((step) => step.kind === "uncovered"), false);
   });
 });
 

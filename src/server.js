@@ -641,10 +641,193 @@ function renderExplainerHtml(quiz, files) {
     html += `<ol class="explainer-walkthrough">${explainer.walkthrough.map((step, index) => renderWalkthroughStep(step, index, files)).join("")}</ol>`;
   }
   if (decisions.length) {
-    html += `<details class="decisions-block"${decisions.length <= 3 ? " open" : ""}><summary>Decisions (${decisions.length})</summary><ul class="decisions-list">${decisions.map((decision) => renderDecisionItem(decision, files)).join("")}</ul></details>`;
+    html += `<details class="decisions-block" id="decisionsBlock"${decisions.length <= 3 ? " open" : ""}><summary>Decisions (${decisions.length})</summary><ul class="decisions-list">${decisions.map((decision) => renderDecisionItem(decision, files)).join("")}</ul></details>`;
   }
   html += "</div>";
   return html;
+}
+
+function decisionFieldData(decision, files) {
+  const hunk = findMatchingHunk(decision.hunk_anchor, files);
+  return {
+    decision_id: decision.id,
+    who: decision.who,
+    text: decision.decision,
+    why: decision.why || "",
+    alternatives: Array.isArray(decision.alternatives) ? decision.alternatives : [],
+    hunk_dom_id: hunk ? hunk.domId : null,
+  };
+}
+
+// Hunks no walkthrough step's hunk_anchor matched - the "what did the explainer never
+// mention" gap, surfaced as its own tour stop (direction 2a, change 2).
+function computeUncoveredHunks(files, walkthrough) {
+  const covered = new Set(walkthrough.map((step) => findMatchingHunk(step.hunk_anchor, files)?.domId).filter(Boolean));
+  const uncovered = [];
+  for (const file of files) {
+    for (const hunk of file.hunks) {
+      if (covered.has(hunk.domId)) continue;
+      uncovered.push({
+        hunk_dom_id: hunk.domId,
+        file: file.file,
+        header: hunk.header,
+        adds: hunk.lines.filter((line) => line.type === "add").length,
+        dels: hunk.lines.filter((line) => line.type === "del").length,
+      });
+    }
+  }
+  return uncovered;
+}
+
+// Builds the "guided tour" step sequence (walkthrough drives, code appears per step, one
+// question-checkpoint at a time - direction 2a, "gated tour"): eli5/summary/background each
+// get their own step, then every walkthrough step in order, with any question whose
+// hunk_anchor matches that step's hunk immediately following it as a checkpoint (re-matched
+// fresh against the real diff, same "never trust the agent's own line numbers" principle used
+// everywhere else), then any remaining unmatched questions. Decisions become their own stops
+// (one each up to 3, one grouped "Decisions (N)" stop beyond that), inserted immediately
+// before the first checkpoint whose question prompt mentions the decision's id, or right after
+// the last walkthrough step if nothing references it. A trailing "uncovered hunks" stop (hunks
+// no walkthrough step ever anchored to) lands right before the final "grade" step, when any
+// exist. Kept as plain step data, not HTML - descriptive text renders client-side via
+// textContent; only the real question-card and diff-hunk DOM nodes get moved into it (they
+// carry live grading/interactive state), so a v1 quiz.json with no explainer still gets a tour
+// of just its checkpoints. Reading is never gated (any read-step, and the raw-diff escape
+// hatch docked at the bottom of the rail, stay reachable at all times) - only ADVANCING past an
+// unresolved checkpoint, or a not-yet-visited decision/uncovered stop, is blocked, enforced
+// client-side. A checkpoint carries hint_step_index (the FINAL tour-sequence index of the
+// walkthrough step it followed, remapped after decision/uncovered stops are spliced in) so the
+// client can offer a "re-read that step" link without losing checkpoint progress.
+function buildTourSteps(quiz, files) {
+  const explainer = quiz.explainer;
+  const walkthrough = explainer?.walkthrough || [];
+  const questions = quiz.questions || [];
+  const decisions = Array.isArray(quiz.decisions) ? quiz.decisions : [];
+
+  const core = [];
+  if (explainer?.eli5) core.push({ kind: "eli5", label: "ELI5", text: explainer.eli5 });
+  if (explainer?.summary) core.push({ kind: "summary", label: "Summary", text: explainer.summary });
+  if (explainer?.background) core.push({ kind: "background", label: "Background", text: explainer.background });
+
+  const walkthroughHunkIds = walkthrough.map((step) => findMatchingHunk(step.hunk_anchor, files)?.domId || null);
+  const questionsByStepIndex = new Map();
+  const looseQuestions = [];
+  for (const question of questions) {
+    const hunk = question.anchor_matched ? findMatchingHunk(question.hunk_anchor, files) : null;
+    const stepIndex = hunk ? walkthroughHunkIds.indexOf(hunk.domId) : -1;
+    if (stepIndex >= 0) {
+      const list = questionsByStepIndex.get(stepIndex) || [];
+      list.push({ question, hunk });
+      questionsByStepIndex.set(stepIndex, list);
+    } else {
+      looseQuestions.push({ question, hunk });
+    }
+  }
+
+  let checkpointNumber = 0;
+  let lastWalkthroughCoreIndex = -1;
+  walkthrough.forEach((step, index) => {
+    const walkthroughCoreIndex = core.length;
+    lastWalkthroughCoreIndex = walkthroughCoreIndex;
+    core.push({ kind: "walkthrough", label: `Step ${index + 1}`, text: step.text, hunk_dom_id: walkthroughHunkIds[index] });
+    for (const { question, hunk } of questionsByStepIndex.get(index) || []) {
+      checkpointNumber += 1;
+      core.push({
+        kind: "checkpoint",
+        label: `Checkpoint ${checkpointNumber}`,
+        question_id: question.id,
+        hunk_dom_id: hunk ? hunk.domId : null,
+        hint_step_index: walkthroughCoreIndex,
+      });
+    }
+  });
+  for (const { question, hunk } of looseQuestions) {
+    checkpointNumber += 1;
+    core.push({
+      kind: "checkpoint",
+      label: `Checkpoint ${checkpointNumber}`,
+      question_id: question.id,
+      hunk_dom_id: hunk ? hunk.domId : null,
+    });
+  }
+
+  const questionsById = new Map(questions.map((question) => [question.id, question]));
+  function firstReferencingCoreIndex(decisionId) {
+    for (let i = 0; i < core.length; i += 1) {
+      const step = core[i];
+      if (step.kind !== "checkpoint") continue;
+      const question = questionsById.get(step.question_id);
+      if (question && typeof question.prompt === "string" && question.prompt.includes(decisionId)) return i;
+    }
+    return -1;
+  }
+  const fallbackAnchor = lastWalkthroughCoreIndex + 1;
+
+  const inserts = [];
+  if (decisions.length > 0 && decisions.length <= 3) {
+    decisions.forEach((decision, index) => {
+      const anchor = firstReferencingCoreIndex(decision.id);
+      inserts.push({
+        anchor: anchor >= 0 ? anchor : fallbackAnchor,
+        step: {
+          kind: "decision",
+          label: `Decision ${decision.id}`,
+          position: index + 1,
+          total: decisions.length,
+          ...decisionFieldData(decision, files),
+        },
+      });
+    });
+  } else if (decisions.length > 3) {
+    let earliest = -1;
+    for (const decision of decisions) {
+      const anchor = firstReferencingCoreIndex(decision.id);
+      if (anchor >= 0 && (earliest === -1 || anchor < earliest)) earliest = anchor;
+    }
+    inserts.push({
+      anchor: earliest >= 0 ? earliest : fallbackAnchor,
+      step: {
+        kind: "decisions-group",
+        label: `Decisions (${decisions.length})`,
+        decisions: decisions.map((decision, index) => ({
+          position: index + 1,
+          total: decisions.length,
+          ...decisionFieldData(decision, files),
+        })),
+      },
+    });
+  }
+
+  // Only meaningful once a walkthrough actually exists - "not covered by an explainer that
+  // was never written" isn't a real gap, it's just the no-explainer case handled elsewhere.
+  const uncovered = walkthrough.length > 0 ? computeUncoveredHunks(files, walkthrough) : [];
+  if (uncovered.length > 0) {
+    inserts.push({ anchor: core.length, step: { kind: "uncovered", label: "Uncovered hunks", hunks: uncovered } });
+  }
+
+  const byAnchor = new Map();
+  for (const { anchor, step } of inserts) {
+    const list = byAnchor.get(anchor) || [];
+    list.push(step);
+    byAnchor.set(anchor, list);
+  }
+  const merged = [];
+  const coreIndexRemap = [];
+  for (let i = 0; i <= core.length; i += 1) {
+    if (byAnchor.has(i)) merged.push(...byAnchor.get(i));
+    if (i < core.length) {
+      coreIndexRemap[i] = merged.length;
+      merged.push(core[i]);
+    }
+  }
+  for (const step of merged) {
+    if (step.kind === "checkpoint" && typeof step.hint_step_index === "number") {
+      step.hint_step_index = coreIndexRemap[step.hint_step_index];
+    }
+  }
+
+  if (merged.length > 0) merged.push({ kind: "grade", label: "Grade" });
+  return merged;
 }
 
 function renderQuestionCard(question) {
@@ -701,17 +884,35 @@ function renderDiffHtml(files, questions) {
 }
 
 export function createChromeHtml(session, { title = "Quiz Review" } = {}) {
+  const files = parseDiffForDisplay(session.diff_text);
+  assignHunkDomIds(files);
+  const questions = session.quiz.questions || [];
+  const diffHtml = renderDiffHtml(files, questions);
+  const explainerHtml = renderExplainerHtml(session.quiz, files);
+  const tour = buildTourSteps(session.quiz, files);
   const sessionJson = jsonScript({
     key: session.key,
     initialChat: session.chat || [],
+    tour,
   });
-  const files = parseDiffForDisplay(session.diff_text);
-  assignHunkDomIds(files);
-  const diffHtml = renderDiffHtml(files, session.quiz.questions || []);
-  const explainerHtml = renderExplainerHtml(session.quiz, files);
   const stat = session.diff_stat || { files_changed: 0, insertions: 0, deletions: 0 };
   const score = session.score || { answered: 0, correct: 0, total: 0 };
   const summary = session.quiz.diff_summary ? `<p class="diff-summary">${escapeHtml(session.quiz.diff_summary)}</p>` : "";
+  // The guided tour only makes sense when there's at least one step (an explainer field or a
+  // question); a trivial review with neither has nothing to walk through, so it goes straight
+  // to (and stays on) full review mode with no toggle at all.
+  const tourToggle = tour.length > 0 ? `<button class="tour-toggle" id="tourToggle" type="button">Guided tour</button>` : "";
+  const significanceChip = session.quiz.significance
+    ? `<span class="chip-mini">${escapeHtml(session.quiz.significance)}</span>`
+    : "";
+  const tourShell =
+    tour.length > 0
+      ? `<div class="tour-mode" id="tourMode"><div class="tour-bar">${significanceChip}<div class="tour-progress-track"><div class="tour-progress-fill" id="tourProgressFill"></div></div><span class="tour-count" id="tourCount"></span></div><div class="tour-layout"><nav class="tour-rail" id="tourRail"></nav><div class="tour-main"><div class="tour-kicker-row" id="tourKickerRow" hidden><span class="tour-kicker" id="tourKicker"></span><span class="decision-badge" id="tourKickerBadge" hidden></span></div><div class="tour-step-label" id="tourStepLabel"></div><div class="tour-step-text" id="tourStepText"></div><div class="tour-decision-fields" id="tourDecisionFields"></div><div class="tour-excerpt-slot" id="tourExcerptSlot"></div><p class="tour-excerpt-caption" id="tourExcerptCaption" hidden>only the hunk this step anchors to - nothing else</p><div class="tour-multi-list" id="tourMultiList"></div><div class="tour-card-slot" id="tourCardSlot"></div><p class="tour-checkpoint-caption" id="tourCheckpointCaption" hidden>Answer correctly to continue - reading is never blocked, only advancing.</p><button class="tour-hint-link" id="tourHintLink" type="button" hidden></button><div class="tour-nav"><button class="button-plain" id="tourBack" type="button">&#9664; back</button><button class="button-plain" id="tourNext" type="button">next &#9654;</button></div></div></div></div>`
+      : "";
+  // fullReview wraps the diff+explainer+questions as one unit so the tour can hide/reveal it
+  // as a whole; it starts hidden whenever a tour exists (the tour is the default landing
+  // view), and is the only thing rendered at all when there's no tour to show.
+  const fullReview = `<div class="diff-meta">${summary}<p class="diff-stat">${stat.files_changed} file(s) changed, +${stat.insertions} -${stat.deletions}</p></div>${explainerHtml}<div class="diff-view" id="diffView">${diffHtml}</div>`;
   return `<!doctype html>
 <html>
 <head>
@@ -721,8 +922,8 @@ export function createChromeHtml(session, { title = "Quiz Review" } = {}) {
 <link rel="stylesheet" href="/chrome.css">
 </head>
 <body class="quiz">
-<div class="bar"><div class="brand"><span class="brand-mark">Quiz</span><span class="brand-support">AXI</span></div><div class="spacer" aria-hidden="true"></div><div class="score-readout" id="scoreReadout">Score: ${score.correct}/${score.total}</div><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${MORE_ICON}</button><div class="menu more-menu" id="moreMenu" hidden><button class="menu-item" id="copyDiff" type="button">Copy diff</button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">End session</button></div></div></div>
-<div class="layout"><div class="frame"><div class="diff-meta">${summary}<p class="diff-stat">${stat.files_changed} file(s) changed, +${stat.insertions} -${stat.deletions}</p></div>${explainerHtml}<div class="diff-view" id="diffView">${diffHtml}</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from quiz-axi.</div><textarea id="chatInput" placeholder="Ask a question about this change..."></textarea><div class="send-hint" id="sendHint" hidden>Write a question first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">Send &amp; End</button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="bar"><div class="brand"><span class="brand-mark">Quiz</span><span class="brand-support">AXI</span></div><div class="spacer" aria-hidden="true"></div>${tourToggle}<div class="score-readout" id="scoreReadout">Score: ${score.correct}/${score.total}</div><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${MORE_ICON}</button><div class="menu more-menu" id="moreMenu" hidden><button class="menu-item" id="copyDiff" type="button">Copy diff</button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">End session</button></div></div></div>
+<div class="layout"><div class="frame"><div id="fullReview"${tour.length > 0 ? " hidden" : ""}>${fullReview}</div>${tourShell}</div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from quiz-axi.</div><textarea id="chatInput" placeholder="Ask a question about this change..."></textarea><div class="send-hint" id="sendHint" hidden>Write a question first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">Send &amp; End</button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card" id="endedCard"><div class="ended-title" id="endedTitle">Session ended.</div><p class="ended-copy" id="endedCopy">Return to your agent to continue.</p></div></div>
 <script id="quiz-session" type="application/json">${sessionJson}</script>
 <script id="diff-raw" type="text/plain">${escapeHtml(session.diff_text || "")}</script>

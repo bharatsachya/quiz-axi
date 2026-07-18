@@ -4,6 +4,7 @@ const sessionDataElement = document.getElementById("quiz-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const initialChat = Array.isArray(sessionData.initialChat) ? sessionData.initialChat : [];
+const tourSpecs = Array.isArray(sessionData.tour) ? sessionData.tour : [];
 const queueStorageKey = "quiz-axi:queued:" + key;
 
 const panelScroll = document.getElementById("panelScroll");
@@ -26,6 +27,26 @@ const endedCopy = document.getElementById("endedCopy");
 const scoreReadout = document.getElementById("scoreReadout");
 const diffView = document.getElementById("diffView");
 const diffRawEl = document.getElementById("diff-raw");
+const tourToggle = document.getElementById("tourToggle");
+const tourMode = document.getElementById("tourMode");
+const fullReview = document.getElementById("fullReview");
+const tourProgressFill = document.getElementById("tourProgressFill");
+const tourCount = document.getElementById("tourCount");
+const tourRail = document.getElementById("tourRail");
+const tourKickerRow = document.getElementById("tourKickerRow");
+const tourKicker = document.getElementById("tourKicker");
+const tourKickerBadge = document.getElementById("tourKickerBadge");
+const tourStepLabel = document.getElementById("tourStepLabel");
+const tourStepText = document.getElementById("tourStepText");
+const tourDecisionFields = document.getElementById("tourDecisionFields");
+const tourExcerptSlot = document.getElementById("tourExcerptSlot");
+const tourExcerptCaption = document.getElementById("tourExcerptCaption");
+const tourMultiList = document.getElementById("tourMultiList");
+const tourCardSlot = document.getElementById("tourCardSlot");
+const tourCheckpointCaption = document.getElementById("tourCheckpointCaption");
+const tourHintLink = document.getElementById("tourHintLink");
+const tourBack = document.getElementById("tourBack");
+const tourNext = document.getElementById("tourNext");
 
 const queued = loadQueuedPrompts();
 let ended = false;
@@ -402,8 +423,10 @@ function applyGradeSync(payload) {
     scoreReadout.textContent = "Score: " + payload.score.correct + "/" + payload.score.total;
   }
   if (payload && payload.question_id) {
+    // A global lookup, not diffView.querySelector: the guided tour moves the real card node
+    // into its own slot outside #diffView, so it must still be found there.
     const selector = '.question-card[data-question-id="' + CSS.escape(payload.question_id) + '"]';
-    const card = diffView.querySelector(selector);
+    const card = document.querySelector(selector);
     if (card) {
       if (payload.verdict === "correct") {
         lockCard(card);
@@ -414,10 +437,11 @@ function applyGradeSync(payload) {
         setCardBadge(card, "incorrect", "Not quite - see feedback below, then try again");
       }
     }
+    setTourVerdict(payload.question_id, payload.verdict);
   }
 }
 
-diffView.addEventListener("click", (event) => {
+document.addEventListener("click", (event) => {
   const target = /** @type {HTMLElement} */ (event.target);
   const button = target.closest(".question-submit");
   if (!button) return;
@@ -446,6 +470,334 @@ document.addEventListener("keydown", (event) => {
   event.preventDefault();
   jumpToHunk(link.dataset.hunkTarget);
 });
+
+// Guided tour: the walkthrough drives, code appears per step. It does not re-render
+// questions or code - it MOVES the real .question-card and .diff-hunk-split nodes already
+// rendered in full review mode into its own slots, so submitting/grading/retry behavior is
+// exactly the same code path either way. Nodes return to their original position whenever a
+// step changes or the tour is exited, so full review mode (still rendered underneath, just
+// hidden) is always left intact.
+function resolveHunkRef(domId) {
+  const el = domId ? document.getElementById(domId) : null;
+  return { el, home: el ? { parent: el.parentNode, next: el.nextSibling } : null };
+}
+
+const tourSteps = tourSpecs.map((spec) => {
+  const hunkEl = spec.hunk_dom_id ? document.getElementById(spec.hunk_dom_id) : null;
+  const cardEl =
+    spec.kind === "checkpoint"
+      ? document.querySelector('.question-card[data-question-id="' + CSS.escape(spec.question_id) + '"]')
+      : null;
+  let multiHunks = null;
+  if (spec.kind === "decisions-group") {
+    multiHunks = spec.decisions.map((decision) => resolveHunkRef(decision.hunk_dom_id));
+  } else if (spec.kind === "uncovered") {
+    multiHunks = spec.hunks.map((hunk) => resolveHunkRef(hunk.hunk_dom_id));
+  }
+  return {
+    ...spec,
+    hunkEl,
+    hunkHome: hunkEl ? { parent: hunkEl.parentNode, next: hunkEl.nextSibling } : null,
+    cardEl,
+    cardHome: cardEl ? { parent: cardEl.parentNode, next: cardEl.nextSibling } : null,
+    multiHunks,
+  };
+});
+
+let tourIndex = 0;
+let tourActive = false;
+const tourVerdictByQuestionId = {};
+const tourVisitedIndices = new Set();
+
+function returnNodeHome(el, home) {
+  if (!el || !home) return;
+  if (home.next && home.next.parentNode === home.parent) {
+    home.parent.insertBefore(el, home.next);
+  } else {
+    home.parent.appendChild(el);
+  }
+}
+
+function returnStepNodesHome(step) {
+  if (!step) return;
+  returnNodeHome(step.hunkEl, step.hunkHome);
+  returnNodeHome(step.cardEl, step.cardHome);
+  if (step.multiHunks) {
+    for (const ref of step.multiHunks) returnNodeHome(ref.el, ref.home);
+  }
+}
+
+function setTourVerdict(questionId, verdict) {
+  tourVerdictByQuestionId[questionId] = verdict === "correct" ? "correct" : verdict === "incorrect" ? "incorrect" : null;
+  if (tourSteps.length) refreshTourStepChrome();
+}
+
+const TOUR_MUST_VISIT_KINDS = new Set(["decision", "decisions-group", "uncovered"]);
+
+// Reading is never gated - you can always look back at anything, and the raw-diff escape
+// hatch docked at the bottom of the rail is always open. Only ADVANCING is gated: the first
+// unresolved checkpoint (not yet graded correct) or not-yet-visited decision/uncovered stop is
+// a hard wall nothing past it is reachable, computed fresh every time (never cached) so a
+// grade arriving mid-browse immediately opens the path forward.
+function maxReachableTourIndex() {
+  for (let index = 0; index < tourSteps.length; index += 1) {
+    const step = tourSteps[index];
+    if (step.kind === "checkpoint" && tourVerdictByQuestionId[step.question_id] !== "correct") return index;
+    if (TOUR_MUST_VISIT_KINDS.has(step.kind) && !tourVisitedIndices.has(index)) return index;
+  }
+  return tourSteps.length - 1;
+}
+
+function tourRailIcon(step, index, maxReachable) {
+  if (index > maxReachable) return "🔒";
+  if (step.kind === "checkpoint") {
+    const verdict = tourVerdictByQuestionId[step.question_id];
+    if (verdict === "correct") return "✓";
+    if (verdict === "incorrect") return "✕";
+    return "◇";
+  }
+  if (step.kind === "uncovered") return "▨";
+  if (TOUR_MUST_VISIT_KINDS.has(step.kind)) return "◈";
+  if (index === tourIndex) return "▸";
+  if (index < tourIndex) return "✓";
+  return step.kind === "grade" ? "⚑" : "";
+}
+
+function tourRailKindClass(step) {
+  return TOUR_MUST_VISIT_KINDS.has(step.kind) ? " tour-rail-decision" : "";
+}
+
+function renderTourRail() {
+  if (!tourRail) return;
+  tourRail.innerHTML = "";
+  const maxReachable = maxReachableTourIndex();
+  tourSteps.forEach((step, index) => {
+    const locked = index > maxReachable;
+    const item = document.createElement("button");
+    item.type = "button";
+    item.disabled = locked;
+    item.className =
+      "tour-rail-item" +
+      tourRailKindClass(step) +
+      (locked ? " tour-rail-locked" : index === tourIndex ? " tour-rail-current" : index < tourIndex ? " tour-rail-done" : "");
+    const icon = document.createElement("span");
+    icon.className = "tour-rail-icon";
+    icon.textContent = tourRailIcon(step, index, maxReachable);
+    const label = document.createElement("span");
+    label.textContent = step.label;
+    item.appendChild(icon);
+    item.appendChild(label);
+    if (!locked) item.addEventListener("click", () => showTourStep(index));
+    tourRail.appendChild(item);
+  });
+  const diffLink = document.createElement("button");
+  diffLink.type = "button";
+  diffLink.className = "tour-rail-diff-link";
+  diffLink.textContent = "Raw diff ↗";
+  diffLink.addEventListener("click", () => exitTourMode());
+  tourRail.appendChild(diffLink);
+}
+
+function decisionFieldRows(container, decision) {
+  container.innerHTML = "";
+  if (decision.why) {
+    const row = document.createElement("p");
+    const lead = document.createElement("strong");
+    lead.textContent = "Why:";
+    row.appendChild(lead);
+    row.appendChild(document.createTextNode(" " + decision.why));
+    container.appendChild(row);
+  }
+  if (decision.alternatives && decision.alternatives.length) {
+    const row = document.createElement("p");
+    const lead = document.createElement("strong");
+    lead.textContent = "Rejected:";
+    row.appendChild(lead);
+    row.appendChild(document.createTextNode(" " + decision.alternatives.join(", ")));
+    container.appendChild(row);
+  }
+}
+
+function whoBadge(el, who) {
+  el.className = "decision-badge " + (who === "human" ? "decision-badge-human" : "decision-badge-agent");
+  el.textContent = who === "human" ? "Human" : "Agent";
+}
+
+function buildDecisionCard(decision, hunkRef) {
+  const card = document.createElement("div");
+  card.className = "tour-decision-card";
+  const kickerRow = document.createElement("div");
+  kickerRow.className = "tour-kicker-row";
+  const kicker = document.createElement("span");
+  kicker.className = "tour-kicker";
+  kicker.textContent = "DECISION " + String(decision.decision_id).toUpperCase() + " · " + decision.position + " OF " + decision.total;
+  const badge = document.createElement("span");
+  whoBadge(badge, decision.who);
+  kickerRow.appendChild(kicker);
+  kickerRow.appendChild(badge);
+  card.appendChild(kickerRow);
+  const headline = document.createElement("div");
+  headline.className = "tour-step-text";
+  headline.textContent = decision.text;
+  card.appendChild(headline);
+  const fields = document.createElement("div");
+  fields.className = "tour-decision-fields";
+  decisionFieldRows(fields, decision);
+  if (fields.childElementCount) card.appendChild(fields);
+  if (hunkRef && hunkRef.el) {
+    const slot = document.createElement("div");
+    slot.className = "tour-excerpt-slot";
+    slot.appendChild(hunkRef.el);
+    card.appendChild(slot);
+  }
+  return card;
+}
+
+function renderStopBody(step) {
+  const isSingleDecision = step.kind === "decision";
+  const isGroup = step.kind === "decisions-group";
+  const isUncovered = step.kind === "uncovered";
+
+  tourKickerRow.hidden = !isSingleDecision;
+  if (isSingleDecision) {
+    tourKicker.textContent = "DECISION " + String(step.decision_id).toUpperCase() + " · " + step.position + " OF " + step.total;
+    tourKickerBadge.hidden = false;
+    whoBadge(tourKickerBadge, step.who);
+  }
+
+  tourStepLabel.hidden = isSingleDecision;
+  tourDecisionFields.innerHTML = "";
+  tourDecisionFields.hidden = !isSingleDecision;
+  tourMultiList.innerHTML = "";
+  tourMultiList.hidden = !(isGroup || isUncovered);
+  tourExcerptSlot.innerHTML = "";
+  tourCardSlot.innerHTML = "";
+
+  if (step.kind === "grade") {
+    tourStepText.hidden = false;
+    tourStepText.textContent =
+      "That's everything. Your agent grades checkpoints live and finishes the review once it's watched you get through them.";
+  } else if (step.kind === "checkpoint") {
+    tourStepText.hidden = true;
+  } else if (isSingleDecision) {
+    tourStepText.hidden = false;
+    tourStepText.textContent = step.text || "";
+    decisionFieldRows(tourDecisionFields, step);
+  } else if (isGroup) {
+    tourStepText.hidden = true;
+    step.decisions.forEach((decision, index) => {
+      tourMultiList.appendChild(buildDecisionCard(decision, step.multiHunks[index]));
+    });
+  } else if (isUncovered) {
+    tourStepText.hidden = false;
+    tourStepText.textContent = "These hunks aren't referenced by any walkthrough step.";
+    step.hunks.forEach((hunkInfo, index) => {
+      const hunkRef = step.multiHunks[index];
+      const row = document.createElement("details");
+      row.className = "tour-uncovered-row";
+      const summary = document.createElement("summary");
+      summary.textContent = hunkInfo.file + " · " + hunkInfo.header + " · +" + hunkInfo.adds + " -" + hunkInfo.dels;
+      row.appendChild(summary);
+      const slot = document.createElement("div");
+      slot.className = "tour-excerpt-slot";
+      row.appendChild(slot);
+      row.addEventListener("toggle", () => {
+        if (!hunkRef.el) return;
+        if (row.open) slot.appendChild(hunkRef.el);
+        else returnNodeHome(hunkRef.el, hunkRef.home);
+      });
+      tourMultiList.appendChild(row);
+    });
+    const footnote = document.createElement("p");
+    footnote.className = "tour-uncovered-footnote";
+    footnote.textContent = "Curious about one of these? Ask your agent in the conversation panel.";
+    tourMultiList.appendChild(footnote);
+  } else {
+    tourStepText.hidden = false;
+    tourStepText.textContent = step.text || "";
+  }
+
+  if (!isGroup && !isUncovered && step.hunkEl) {
+    tourExcerptSlot.appendChild(step.hunkEl);
+    tourExcerptCaption.hidden = false;
+  } else {
+    tourExcerptCaption.hidden = true;
+  }
+  if (step.cardEl) tourCardSlot.appendChild(step.cardEl);
+}
+
+function showTourStep(index) {
+  if (!tourSteps.length) return;
+  const maxReachable = maxReachableTourIndex();
+  const bounded = Math.max(0, Math.min(index, tourSteps.length - 1, maxReachable));
+  returnStepNodesHome(tourSteps[tourIndex]);
+  tourIndex = bounded;
+  tourVisitedIndices.add(tourIndex);
+  const step = tourSteps[tourIndex];
+  tourStepLabel.textContent = step.label;
+  renderStopBody(step);
+  if (step.kind === "checkpoint" && typeof step.hint_step_index === "number" && tourSteps[step.hint_step_index]) {
+    const hintTarget = step.hint_step_index;
+    tourHintLink.textContent = "hint: re-read " + tourSteps[hintTarget].label + " ▸";
+    tourHintLink.onclick = () => showTourStep(hintTarget);
+  } else {
+    tourHintLink.onclick = null;
+  }
+  refreshTourStepChrome();
+}
+
+// Updates everything that depends on live grading state (nav button disabled-ness, the
+// checkpoint caption, the hint link's visibility, the rail) without touching the excerpt/card
+// slots - called both at the end of showTourStep and whenever a grade-sync arrives, so
+// answering the current checkpoint correctly unlocks "next" immediately without re-moving the
+// already-in-place hunk/card nodes (which could otherwise steal focus mid-interaction).
+function refreshTourStepChrome() {
+  const step = tourSteps[tourIndex];
+  const maxReachable = maxReachableTourIndex();
+  const isOpenCheckpoint = step.kind === "checkpoint" && tourVerdictByQuestionId[step.question_id] !== "correct";
+  tourCheckpointCaption.hidden = !isOpenCheckpoint;
+  tourHintLink.hidden = !(step.kind === "checkpoint" && typeof step.hint_step_index === "number");
+  tourCount.textContent = tourIndex + 1 + " / " + tourSteps.length;
+  tourProgressFill.style.width = Math.round(((tourIndex + 1) / tourSteps.length) * 100) + "%";
+  tourBack.disabled = tourIndex === 0;
+  tourNext.disabled = tourIndex >= Math.min(tourSteps.length - 1, maxReachable);
+  tourNext.textContent = TOUR_MUST_VISIT_KINDS.has(step.kind) ? "understood ▶" : "next ▶";
+  renderTourRail();
+}
+
+function enterTourMode() {
+  tourActive = true;
+  if (fullReview) fullReview.hidden = true;
+  tourMode.hidden = false;
+  showTourStep(tourIndex);
+}
+
+function exitTourMode() {
+  returnStepNodesHome(tourSteps[tourIndex]);
+  tourActive = false;
+  tourMode.hidden = true;
+  if (fullReview) fullReview.hidden = false;
+}
+
+function isTypingTarget(el) {
+  const tag = el && el.tagName;
+  return tag === "TEXTAREA" || tag === "INPUT" || (el && el.isContentEditable);
+}
+
+if (tourMode && tourSteps.length) {
+  tourBack.addEventListener("click", () => showTourStep(tourIndex - 1));
+  tourNext.addEventListener("click", () => showTourStep(tourIndex + 1));
+  if (tourToggle) tourToggle.addEventListener("click", enterTourMode);
+  document.addEventListener("keydown", (event) => {
+    if (!tourActive || isTypingTarget(event.target)) return;
+    if (event.key === "ArrowRight") showTourStep(tourIndex + 1);
+    else if (event.key === "ArrowLeft") showTourStep(tourIndex - 1);
+  });
+  enterTourMode();
+} else if (tourMode) {
+  tourMode.hidden = true;
+  if (fullReview) fullReview.hidden = false;
+}
 
 moreButton.onclick = () => toggleMenu(moreButton, moreMenu);
 copyDiffButton.onclick = copyDiffText;
