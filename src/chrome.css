@@ -280,6 +280,17 @@ body {
   color: var(--fg-muted);
   word-break: break-all;
 }
+.diff-hunk-details {
+  margin: 0;
+}
+.diff-hunk-summary {
+  cursor: pointer;
+  padding: 2px var(--space-6);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--fg-label);
+  background: var(--bg-elevated);
+}
 .diff-hunk-split {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -288,12 +299,6 @@ body {
   font-size: var(--text-xs);
   line-height: 1.5;
   background: var(--bg-panel);
-}
-.split-hunk-header {
-  grid-column: 1 / -1;
-  padding: 2px var(--space-6);
-  color: var(--fg-label);
-  background: var(--bg-elevated);
 }
 .split-cell {
   display: flex;
@@ -922,7 +927,7 @@ body {
   line-height: 1.5;
   color: var(--fg);
 }
-.tour-excerpt-slot .diff-hunk-split {
+.tour-excerpt-slot .diff-hunk-details {
   border-radius: var(--radius-md);
   border: 1px solid var(--border-subtle);
   overflow: hidden;

@@ -862,7 +862,7 @@ function renderDiffHtml(files, questions) {
     const placed = new Set();
     for (const hunk of file.hunks) {
       const rows = buildSplitRows(hunk.lines);
-      html += `<div class="diff-hunk-split" id="${hunk.domId}"><div class="split-hunk-header">${escapeHtml(hunk.header)}</div>${rows.map(renderSplitRow).join("")}</div>`;
+      html += `<details class="diff-hunk-details" id="${hunk.domId}" open><summary class="diff-hunk-summary">${escapeHtml(hunk.header)}</summary><div class="diff-hunk-split">${rows.map(renderSplitRow).join("")}</div></details>`;
       const matched = fileQuestions.filter(
         (question) =>
           !placed.has(question.id) &&

@@ -237,7 +237,7 @@ test("a v1 quiz.json (no explainer, no decisions) renders with no explainer bloc
     assert.doesNotMatch(html, /Like I'm five/);
     assert.doesNotMatch(html, /decisions-block/);
     // The diff view itself is unaffected by hunk id assignment.
-    assert.match(html, /diff-hunk-split" id="hunk-0"/);
+    assert.match(html, /diff-hunk-details" id="hunk-0"/);
   });
 });
 
