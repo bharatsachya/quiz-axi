@@ -91,3 +91,22 @@ test("verifyOneDiff: passed review allows", async () => {
     assert.equal(result.ok, true);
   });
 });
+
+test("verifyOneDiff: self-authored pass is allowed and reports method self-authored", async () => {
+  await withStore(async (store) => {
+    await store.sealSelfAuthored("key1", { repoRoot: "/repo", summary: "typo fix" });
+    const result = await verifyOneDiff(store, "key1", "main");
+    assert.equal(result.ok, true);
+    assert.equal(result.method, "self-authored");
+  });
+});
+
+test("verifyOneDiff: a quiz-graded pass reports method quiz", async () => {
+  await withStore(async (store) => {
+    await store.upsertSession("key1", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: { questions: [] } });
+    await store.finishGrading("key1", { result: "pass", summary: "" });
+    const result = await verifyOneDiff(store, "key1", "main");
+    assert.equal(result.ok, true);
+    assert.equal(result.method, "quiz");
+  });
+});

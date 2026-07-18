@@ -7,6 +7,7 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#how-it-works">How it works</a> ·
+  <a href="#escape-hatches">Escape hatches</a> ·
   <a href="#cli-reference">CLI reference</a> ·
   <a href="#architecture-notes">Architecture</a>
 </p>
@@ -78,11 +79,21 @@ A `quiz.json` is a small file describing questions about the current diff:
 
 Write it **outside the repo** — it would otherwise become part of the diff it's describing. See the project skill at [`.claude/skills/quiz-axi/SKILL.md`](.claude/skills/quiz-axi/SKILL.md) for the full agent-facing workflow (this is what makes `/quiz-axi` work in Claude Code).
 
+## Escape hatches
+
+By design, every push is gated — including your own hand-typed one-line fix. But not every diff needs an AI-comprehension check: if you personally wrote the change, there's nothing for an agent to explain and nothing for you to be quizzed on. Without an honest answer to "what do I do about *that* case," the informal answer becomes reaching for git's blunt bypass out of habit — which quietly trains the exact behavior the tool exists to prevent. So there are two, and they're for different situations:
+
+- **`git push --no-verify`** — git's own standard hook bypass, works here exactly like it does for any other pre-push hook (lint-staged, commitlint, etc.). Use it when you need to get past the gate right now and don't want to leave a record. It skips *every* pre-push hook, not just this one, and quiz-axi has no visibility into it — there's nothing in `state.json` to show it happened.
+- **`quiz-axi review --self-authored [--summary "..."]`** — seals the current diff as passed instantly, with no quiz, no browser, no agent involved. For a human, at their own keyboard, sealing a change they personally wrote. Unlike `--no-verify`, this leaves an honest, visible record: `state.json`'s `review_index` entry (and `quiz-axi verify`'s own output) mark it `method: "self-authored"`, distinct from `method: "quiz"` for an agent-graded pass — so nothing pretends a human read something they didn't.
+
+Neither is technically enforced against agent use — nothing stops an agent from typing `--self-authored` (or `--no-verify`) to dodge a review it doesn't want to do, same as nothing stops it from typing any other command. The project skill tells agents explicitly never to reach for `--self-authored` on their own initiative; the safeguard here is visibility and an honest record, not prevention.
+
 ## CLI reference
 
 | Command | Description |
 | --- | --- |
 | `quiz-axi review --quiz <quiz.json> [--base <ref>] [--no-open]` | Open a review session for the current diff (working tree vs. the resolved base branch). |
+| `quiz-axi review --self-authored [--summary "..."]` | Seal the current diff as passed instantly, no quiz — for a human sealing their own hand-written change. See [Escape hatches](#escape-hatches). |
 | `quiz-axi poll <diff_key> [--agent-reply "..."]` | Long-poll until the human answers, asks something, or ends the session. |
 | `quiz-axi grade <diff_key> --question <id> --verdict correct\|incorrect [--feedback "..."]` | Record a live verdict for one answered question. |
 | `quiz-axi grade <diff_key> --finish pass\|fail [--summary "..."]` | Seal the review record `verify` checks. Requires every question graded to pass. |
@@ -110,6 +121,7 @@ Write it **outside the repo** — it would otherwise become part of the diff it'
 - **Diff identity**: `sha256(repoRoot + "\n" + diffText).slice(0, 16)`. Stable across a rebase that reproduces identical content (git blob hashes are pure content hashes); changes the instant real content changes.
 - **Base resolution** (`review`, `verify`, and the push-time hook all use the *same* logic): `--base`/`QUIZ_AXI_BASE_BRANCH` → `@{upstream}` → `origin/HEAD` → `origin/main` → `origin/master` → local `main` → local `master`. Re-pushing an already-reviewed branch with one more commit re-diffs the *whole branch* against that same base, not just what's new since the last push — so a small follow-up commit correctly requires re-review too.
 - **Untracked files are excluded from the reviewed diff** — `git add` anything new you want included. This is what keeps the diff `review` computes identical to what `git push` actually sends; an untracked scratch file (including `quiz.json` itself, if left inside the repo) would otherwise silently ride along into the review but never reach the remote, breaking the gate.
+- **`review` diffs your working tree; `verify` (the real git hook) diffs the actual pushed commit — never the working tree.** Git always pipes the ref-update lines a pre-push hook needs on stdin, so `verify` invoked by a real `git push` reliably takes the commit-based path (`computeRangeDiff`), completely ignoring whatever is sitting dirty in your files at push time; the working-tree path (`computeCurrentDiff`) only runs for a manual, no-stdin `quiz-axi verify` (a "would this pass right now" check with nothing to push yet). Because identity is content-addressed, this can never let a push through with *different* content than what was reviewed — a mismatch always produces a different hash and fails closed, blocked as "no review found," never silently waved through (verified by pushing a partial commit of a two-file reviewed diff: it was correctly rejected, and only passed once the committed content matched the reviewed working tree exactly). The failure mode is the safe direction, not the dangerous one: if what you eventually commit doesn't exactly match what `review` saw in your working tree, the push gets a confusing "no review found" instead of a clear "this doesn't match" — so review right before committing exactly that state, not while other unrelated edits are still lingering uncommitted.
 - **No iframe, no sandbox** — unlike artifact-review tools that must safely render arbitrary agent-authored HTML, quiz-axi only ever renders a diff and quiz spec through its own escaped, trusted templates, so the browser chrome renders the page directly with no injected SDK or postMessage protocol.
 - Session state lives in `~/.quiz-axi/state.json` as two maps: `sessions` (live review state — chat, answers, score) and `review_index` (the sealed pass/fail record `verify` reads).
 

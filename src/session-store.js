@@ -261,6 +261,29 @@ export class SessionStore {
     await this.writeState(state);
     return session;
   }
+
+  // Seals a diff as passed with no quiz session at all - meant for a human, at their own
+  // keyboard, sealing a change they personally wrote and don't need to be quizzed on. Marked
+  // `method: "self-authored"` (vs. "quiz" for a live-graded pass) so state.json and `verify`'s
+  // output stay honest about which path produced the pass - this command can't be technically
+  // prevented from being run by an agent instead of a human (same as git's own --no-verify
+  // can't be), so visibility is the safeguard, not enforcement.
+  async sealSelfAuthored(key, { repoRoot, summary }) {
+    const now = new Date().toISOString();
+    const state = await this.readState();
+    state.review_index[key] = {
+      ...(state.review_index[key] || { session_key: key, created_at: now }),
+      status: "passed",
+      passed: true,
+      method: "self-authored",
+      summary: summary || "",
+      repo_root: repoRoot,
+      finished_at: now,
+      updated_at: now,
+    };
+    await this.writeState(state);
+    return state.review_index[key];
+  }
 }
 
 function sealReviewIndex(state, session, key, result, now) {
@@ -268,6 +291,7 @@ function sealReviewIndex(state, session, key, result, now) {
     ...(state.review_index[key] || { repo_root: session.repo_root, session_key: key, created_at: now }),
     status: result === "pass" ? "passed" : "failed",
     passed: result === "pass",
+    method: "quiz",
     score: session.score,
     finished_at: now,
     updated_at: now,

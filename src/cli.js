@@ -102,6 +102,7 @@ export function createHomeOutput({ bin, sessions, agent = "generic" }) {
     })),
     help: [
       'Run `quiz-axi review --quiz <quiz.json> [--base <ref>] [--no-open]` to open a review session for the current diff (working tree vs. the resolved base branch). `git add` any new files you want included first - untracked files are deliberately excluded so the reviewed diff always matches what a later `git push` actually sends; write quiz.json itself outside the repo (or gitignore it) so it never becomes part of the diff it describes. quiz.json is a JSON file you generate: {"questions":[{"id","type":"multiple-choice"|"free-text","prompt","choices"?,"hunk_anchor"?:{"file","start_line","end_line"}}]}. There is no answer key field - grading is always live, never auto-graded.',
+      '`quiz-axi review --self-authored [--summary "..."]` seals the current diff as passed with no quiz at all - for a human sealing a change they personally wrote themselves, at their own keyboard. Agents must never run --self-authored on their own initiative to skip a review; it is not a substitute for the quiz workflow above.',
       `Run \`quiz-axi poll <diff_key>\` to wait for the human to answer a question, ask a free-text question back, or end the session. It long-polls and stays silent until something happens - leave it running, never kill it. ${pollExecutionGuidance({ agent })}`,
       "Run `quiz-axi grade <diff_key> --question <id> --verdict correct|incorrect [--feedback \"...\"]` to record your live verdict for one answered question, then poll again.",
       'Run `quiz-axi grade <diff_key> --finish pass|fail [--summary "..."]` once the human is done - this is the record `quiz-axi verify` (the husky pre-push gate) checks before allowing `git push`. If the diff changes again afterward, the new diff has no review record and the gate re-blocks - that is intentional integrity, not a bug.',
@@ -115,11 +116,29 @@ export function createHomeOutput({ bin, sessions, agent = "generic" }) {
 }
 
 async function reviewCommand(args) {
+  const baseOverride = flagValue(args, "--base") || undefined;
+
+  // Meant to be typed by a human, at their own keyboard, for a change they personally wrote and
+  // don't need to be quizzed on - not something an agent should ever invoke on its own
+  // initiative to dodge a review. Nothing technically stops an agent from running this anyway
+  // (same as nothing stops `git push --no-verify`); the review_index `method: "self-authored"`
+  // marker is a visibility safeguard, not an enforcement one.
+  if (args.includes("--self-authored")) {
+    const { repoRoot, diffText } = computeCurrentDiff({ baseOverride });
+    if (diffText.trim() === "") {
+      throw new AxiError("No diff to seal - the working tree matches the base branch", "VALIDATION_ERROR");
+    }
+    const key = diffKey({ repoRoot, diffText });
+    const summary = flagValue(args, "--summary") || "";
+    const store = new SessionStore(stateFile());
+    await store.sealSelfAuthored(key, { repoRoot, summary });
+    return createSelfAuthoredOutput({ diffKey: key });
+  }
+
   const quizPath = flagValue(args, "--quiz");
   if (!quizPath) {
     throw new AxiError("--quiz <path> is required", "VALIDATION_ERROR", ["Run `quiz-axi review --quiz <quiz.json>`"]);
   }
-  const baseOverride = flagValue(args, "--base") || undefined;
   const { repoRoot, diffText, stat } = computeCurrentDiff({ baseOverride });
   if (diffText.trim() === "") {
     throw new AxiError("No diff to review - the working tree matches the base branch", "VALIDATION_ERROR", [
@@ -150,6 +169,16 @@ async function reviewCommand(args) {
 
 export function shouldOpenBrowser(args, env) {
   return !args.includes("--no-open") && env.QUIZ_AXI_NO_OPEN !== "1";
+}
+
+export function createSelfAuthoredOutput({ diffKey: key }) {
+  return {
+    review: { diff_key: key, status: "sealed", method: "self-authored", passed: true },
+    next_step:
+      `Sealed as passed with no quiz - this diff is now clear to \`git push\`, as long as it doesn't change again ` +
+      `before then. This command is meant for a human to run themselves for a change they personally wrote; agents ` +
+      `should not run \`--self-authored\` on their own to skip a review.`,
+  };
 }
 
 export function createReviewOutput({ diffKey: key, url, status }) {
@@ -403,7 +432,7 @@ async function verifyCommand(args) {
     if (!result.ok) {
       throw new AxiError("quiz-axi review gate failed", "VALIDATION_ERROR", [result.message]);
     }
-    return { verify: { status: "passed", refs: [{ ref: result.ref, diff_key: result.key }] } };
+    return { verify: { status: "passed", refs: [{ ref: result.ref, diff_key: result.key, method: result.method }] } };
   }
   const results = [];
   for (const ref of refs) {
@@ -415,7 +444,12 @@ async function verifyCommand(args) {
   if (failed.length > 0) {
     throw new AxiError("quiz-axi review gate failed", "VALIDATION_ERROR", failed.map((result) => result.message));
   }
-  return { verify: { status: "passed", refs: results.map((result) => ({ ref: result.ref, diff_key: result.key })) } };
+  return {
+    verify: {
+      status: "passed",
+      refs: results.map((result) => ({ ref: result.ref, diff_key: result.key, method: result.method })),
+    },
+  };
 }
 
 export async function verifyOneDiff(store, key, refLabel) {
@@ -429,7 +463,7 @@ export async function verifyOneDiff(store, key, refLabel) {
     };
   }
   if (record.status === "passed") {
-    return { ok: true, ref: refLabel, key };
+    return { ok: true, ref: refLabel, key, method: record.method || "quiz" };
   }
   const score = record.score || { correct: 0, total: 0 };
   if (record.status === "failed") {
@@ -789,12 +823,12 @@ export function getCommandHelp(command, { agent = "generic" } = {}) {
 }
 
 function createTopLevelHelp({ agent = "generic" } = {}) {
-  return `quiz-axi - quiz-axi AXI\n\nUsage:\n  quiz-axi\n  quiz-axi review --quiz <quiz.json> [--base <ref>] [--no-open]\n  quiz-axi poll <diff_key> [--agent-reply "..."]\n  quiz-axi grade <diff_key> --question <id> --verdict correct|incorrect [--feedback "..."]\n  quiz-axi grade <diff_key> --finish pass|fail [--summary "..."]\n  quiz-axi end <diff_key>\n  quiz-axi verify\n  quiz-axi stop\n  quiz-axi setup hooks\n  quiz-axi server\n\nNote: poll long-polls indefinitely by default until the human acts, staying silent while it waits - never kill it. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })}\n\n`;
+  return `quiz-axi - quiz-axi AXI\n\nUsage:\n  quiz-axi\n  quiz-axi review --quiz <quiz.json> [--base <ref>] [--no-open]\n  quiz-axi review --self-authored [--summary "..."]\n  quiz-axi poll <diff_key> [--agent-reply "..."]\n  quiz-axi grade <diff_key> --question <id> --verdict correct|incorrect [--feedback "..."]\n  quiz-axi grade <diff_key> --finish pass|fail [--summary "..."]\n  quiz-axi end <diff_key>\n  quiz-axi verify\n  quiz-axi stop\n  quiz-axi setup hooks\n  quiz-axi server\n\nNote: poll long-polls indefinitely by default until the human acts, staying silent while it waits - never kill it. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })}\n\n`;
 }
 
 function createCommandHelp({ agent = "generic" } = {}) {
   return {
-    review: `Usage: quiz-axi review --quiz <quiz.json> [--base <ref>] [--no-open]\n\nOpen a review session for the current diff (working tree vs. the resolved base branch: --base, QUIZ_AXI_BASE_BRANCH, @{upstream}, origin/HEAD, origin/main, or main, in that order). Untracked files are excluded - \`git add\` any new files first, or they will not appear in the reviewed diff and will not match what a later push sends. quiz.json describes questions about the diff; there is no answer key field, grading is always live via \`quiz-axi grade\`.\n`,
+    review: `Usage: quiz-axi review --quiz <quiz.json> [--base <ref>] [--no-open]\n       quiz-axi review --self-authored [--summary "..."] [--base <ref>]\n\nOpen a review session for the current diff (working tree vs. the resolved base branch: --base, QUIZ_AXI_BASE_BRANCH, @{upstream}, origin/HEAD, origin/main, or main, in that order). Untracked files are excluded - \`git add\` any new files first, or they will not appear in the reviewed diff and will not match what a later push sends. quiz.json describes questions about the diff; there is no answer key field, grading is always live via \`quiz-axi grade\`.\n\n--self-authored seals the diff as passed immediately with no quiz, no browser, no agent - meant for a human sealing a change they personally wrote. Agents should not run this themselves to skip a review.\n`,
     poll: `Usage: quiz-axi poll <diff_key> [--agent-reply "..."]\n\nLong-polls indefinitely for a human answer, question, or session end. Stays silent while waiting - never kill it. ${pollExecutionGuidance({ agent })} Use --agent-reply to display your response before waiting again.\n`,
     grade: `Usage: quiz-axi grade <diff_key> --question <id> --verdict correct|incorrect [--feedback "..."]\n       quiz-axi grade <diff_key> --finish pass|fail [--summary "..."]\n\nRecords a live verdict for one answered question, or seals the review record that \`quiz-axi verify\` checks.\n`,
     end: `Usage: quiz-axi end <diff_key>\n\nEnd a review session as the agent.\n`,

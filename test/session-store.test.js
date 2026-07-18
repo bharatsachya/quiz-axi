@@ -260,3 +260,30 @@ test("prompts queued before an end are still delivered before the ended status",
     assert.equal(after.status, "ended");
   });
 });
+
+test("sealSelfAuthored seals review_index as passed with no session and no quiz, marked method self-authored", async () => {
+  await withStore(async (store) => {
+    const record = await store.sealSelfAuthored("key1", { repoRoot: "/repo", summary: "typo fix" });
+    assert.equal(record.status, "passed");
+    assert.equal(record.passed, true);
+    assert.equal(record.method, "self-authored");
+    assert.equal(record.summary, "typo fix");
+
+    const fromIndex = await store.findReviewIndex("key1");
+    assert.equal(fromIndex.status, "passed");
+    assert.equal(fromIndex.method, "self-authored");
+
+    // No live session is created for a self-authored seal.
+    const session = await store.findByKey("key1");
+    assert.equal(session, null);
+  });
+});
+
+test("a quiz-graded pass is marked method quiz, distinguishing it from a self-authored one", async () => {
+  await withStore(async (store) => {
+    await store.upsertSession("key1", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: { questions: [] } });
+    await store.finishGrading("key1", { result: "pass" });
+    const record = await store.findReviewIndex("key1");
+    assert.equal(record.method, "quiz");
+  });
+});
