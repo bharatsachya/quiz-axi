@@ -425,6 +425,28 @@ diffView.addEventListener("click", (event) => {
   if (card) submitAnswer(card);
 });
 
+function jumpToHunk(hunkId) {
+  const hunkEl = document.getElementById(hunkId);
+  if (!hunkEl) return;
+  hunkEl.scrollIntoView({ block: "center", behavior: "smooth" });
+  hunkEl.classList.add("hunk-highlight");
+  setTimeout(() => hunkEl.classList.remove("hunk-highlight"), 1600);
+}
+
+document.addEventListener("click", (event) => {
+  const target = /** @type {HTMLElement} */ (event.target);
+  const link = target.closest("[data-hunk-target]");
+  if (link) jumpToHunk(link.dataset.hunkTarget);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const target = /** @type {HTMLElement} */ (event.target);
+  const link = target.closest("[data-hunk-target]");
+  if (!link) return;
+  event.preventDefault();
+  jumpToHunk(link.dataset.hunkTarget);
+});
+
 moreButton.onclick = () => toggleMenu(moreButton, moreMenu);
 copyDiffButton.onclick = copyDiffText;
 endButton.onclick = () => {

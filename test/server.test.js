@@ -205,6 +205,82 @@ test("a trivial (zero-question) quiz can be finished as pass immediately, with n
   });
 });
 
+test("a v1 quiz.json (no explainer, no decisions) renders with no explainer block at all", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "v1renderkey123456";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: QUIZ });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.doesNotMatch(html, /class="explainer"/);
+    assert.doesNotMatch(html, /Like I'm five/);
+    assert.doesNotMatch(html, /decisions-block/);
+    // The diff view itself is unaffected by hunk id assignment.
+    assert.match(html, /diff-hunk-split" id="hunk-0"/);
+  });
+});
+
+test("the explainer ladder renders eli5, summary, background, and a walkthrough step linked to its real hunk", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "laddereeekey123456";
+    const quiz = {
+      version: 3,
+      significance: "small",
+      questions: [],
+      explainer: {
+        eli5: "When you refresh, it now remembers your choice.",
+        summary: "Persist the toggle to localStorage.",
+        background: "The settings panel already re-renders from a single state object.",
+        walkthrough: [{ text: "Added the write to localStorage.", hunk_anchor: { file: "f.js", start_line: 1, end_line: 2 } }],
+      },
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(html, /class="explainer"/);
+    // eli5 appears before summary, which appears before background, which appears before the walkthrough.
+    const eli5At = html.indexOf("When you refresh");
+    const summaryAt = html.indexOf("Persist the toggle");
+    const backgroundAt = html.indexOf("already re-renders");
+    const walkthroughAt = html.indexOf("Added the write to localStorage");
+    assert.ok(eli5At > -1 && eli5At < summaryAt && summaryAt < backgroundAt && backgroundAt < walkthroughAt);
+    // The walkthrough step's hunk_anchor matched a real hunk, so it links to it by id.
+    assert.match(html, /class="walkthrough-step walkthrough-step-linked" data-hunk-target="hunk-0"/);
+  });
+});
+
+test("a walkthrough step or decision with an unmatched hunk_anchor degrades gracefully - no link, no crash", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "unmatchedkey123456";
+    const quiz = {
+      version: 3,
+      questions: [],
+      significance: "trivial",
+      explainer: {
+        summary: "x",
+        walkthrough: [{ text: "Refers to a file not in this diff.", hunk_anchor: { file: "nowhere.js", start_line: 1, end_line: 2 } }],
+      },
+      decisions: [{ id: "d1", who: "human", decision: "Keep it simple", why: "user said so" }],
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const res = await fetch(`${baseUrl}/session/${key}`);
+    assert.equal(res.status, 200);
+    const html = await res.text();
+    assert.match(html, /class="walkthrough-step">/);
+    assert.doesNotMatch(html, /walkthrough-step-linked/);
+    assert.match(html, /decision-badge decision-badge-human">Human/);
+  });
+});
+
+test("decisions render collapsed (details, not open) once there are more than 3", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "manydecisionskey12";
+    const decisions = Array.from({ length: 4 }, (_, i) => ({ id: `d${i}`, decision: `Decision ${i}`, why: "" }));
+    const quiz = { version: 3, questions: [], significance: "trivial", decisions };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(html, /<details class="decisions-block"><summary>Decisions \(4\)/);
+    assert.doesNotMatch(html, /<details class="decisions-block" open>/);
+  });
+});
+
 test("grading before an answer exists returns 400, not 500", async () => {
   await withServer(async (baseUrl) => {
     const key = "badgradekey123456";

@@ -575,6 +575,78 @@ function renderSplitRow(row) {
   return renderSplitCell(row.left, "left") + renderSplitCell(row.right, "right");
 }
 
+// Finds the real hunk (from server.js's own diff parse) that an anchor overlaps, the same
+// "never trust the agent's own line numbers" check already used to place question cards.
+// Walkthrough steps and decisions are display-only (never graded), so this is done fresh at
+// render time instead of threading an extra anchor_matched field through quiz.js.
+function findMatchingHunk(anchor, files) {
+  if (!anchor) return null;
+  const fileEntry = files.find((entry) => entry.file === anchor.file);
+  if (!fileEntry) return null;
+  return fileEntry.hunks.find((hunk) => anchor.start_line <= hunk.endLine && anchor.end_line >= hunk.startLine) || null;
+}
+
+function assignHunkDomIds(files) {
+  let counter = 0;
+  for (const file of files) {
+    for (const hunk of file.hunks) {
+      hunk.domId = `hunk-${counter}`;
+      counter += 1;
+    }
+  }
+}
+
+function renderWalkthroughStep(step, index, files) {
+  const hunk = findMatchingHunk(step.hunk_anchor, files);
+  const linkAttrs = hunk ? ` data-hunk-target="${hunk.domId}" role="button" tabindex="0"` : "";
+  const linkClass = hunk ? " walkthrough-step-linked" : "";
+  return `<li class="walkthrough-step${linkClass}"${linkAttrs}><span class="walkthrough-index">${index + 1}</span><span class="walkthrough-text">${escapeHtml(step.text)}</span></li>`;
+}
+
+function renderDecisionItem(decision, files) {
+  const hunk = findMatchingHunk(decision.hunk_anchor, files);
+  const linkAttrs = hunk ? ` data-hunk-target="${hunk.domId}" role="button" tabindex="0"` : "";
+  const linkClass = hunk ? " decision-item-linked" : "";
+  const badgeClass = decision.who === "human" ? "decision-badge-human" : "decision-badge-agent";
+  const badgeText = decision.who === "human" ? "Human" : "Agent";
+  const alternatives =
+    Array.isArray(decision.alternatives) && decision.alternatives.length
+      ? `<div class="decision-alternatives">Considered: ${decision.alternatives.map(escapeHtml).join(", ")}</div>`
+      : "";
+  const why = decision.why ? `<div class="decision-why">${escapeHtml(decision.why)}</div>` : "";
+  return `<li class="decision-item${linkClass}"${linkAttrs}><span class="decision-badge ${badgeClass}">${badgeText}</span><div class="decision-body"><div class="decision-text">${escapeHtml(decision.decision)}</div>${why}${alternatives}</div></li>`;
+}
+
+// Renders the ladder above the split diff: eli5 (plainest, most prominent) first, then
+// summary/background, then the story-order walkthrough, then decisions. Returns "" when the
+// quiz carries neither `explainer` nor `decisions` (any v1 quiz.json, and any v2/v3 one that
+// omits both), so a v1 review renders byte-identical to before this existed.
+function renderExplainerHtml(quiz, files) {
+  const explainer = quiz.explainer;
+  const decisions = Array.isArray(quiz.decisions) ? quiz.decisions : [];
+  const hasWalkthrough = Boolean(explainer?.walkthrough?.length);
+  if (!explainer && decisions.length === 0) return "";
+
+  let html = '<div class="explainer">';
+  if (explainer?.eli5) {
+    html += `<div class="explainer-eli5"><div class="explainer-label">Like I'm five</div><p>${escapeHtml(explainer.eli5)}</p></div>`;
+  }
+  if (explainer?.summary) {
+    html += `<p class="explainer-summary">${escapeHtml(explainer.summary)}</p>`;
+  }
+  if (explainer?.background) {
+    html += `<div class="explainer-background"><div class="explainer-label">Background</div><p>${escapeHtml(explainer.background)}</p></div>`;
+  }
+  if (hasWalkthrough) {
+    html += `<ol class="explainer-walkthrough">${explainer.walkthrough.map((step, index) => renderWalkthroughStep(step, index, files)).join("")}</ol>`;
+  }
+  if (decisions.length) {
+    html += `<details class="decisions-block"${decisions.length <= 3 ? " open" : ""}><summary>Decisions (${decisions.length})</summary><ul class="decisions-list">${decisions.map((decision) => renderDecisionItem(decision, files)).join("")}</ul></details>`;
+  }
+  html += "</div>";
+  return html;
+}
+
 function renderQuestionCard(question) {
   const body =
     question.type === "multiple-choice"
@@ -588,8 +660,7 @@ function renderQuestionCard(question) {
   return `<div class="question-card" data-question-id="${escapeHtml(question.id)}" data-question-type="${question.type}"><div class="question-prompt">${escapeHtml(question.prompt)}</div>${body}<div class="question-actions"><button class="button question-submit" type="button">Submit Answer</button><span class="question-badge" hidden></span></div></div>`;
 }
 
-function renderDiffHtml(diffText, questions) {
-  const files = parseDiffForDisplay(diffText);
+function renderDiffHtml(files, questions) {
   if (files.length === 0) {
     return '<p class="diff-empty">No diff content.</p>';
   }
@@ -608,7 +679,7 @@ function renderDiffHtml(diffText, questions) {
     const placed = new Set();
     for (const hunk of file.hunks) {
       const rows = buildSplitRows(hunk.lines);
-      html += `<div class="diff-hunk-split"><div class="split-hunk-header">${escapeHtml(hunk.header)}</div>${rows.map(renderSplitRow).join("")}</div>`;
+      html += `<div class="diff-hunk-split" id="${hunk.domId}"><div class="split-hunk-header">${escapeHtml(hunk.header)}</div>${rows.map(renderSplitRow).join("")}</div>`;
       const matched = fileQuestions.filter(
         (question) =>
           !placed.has(question.id) &&
@@ -634,7 +705,10 @@ export function createChromeHtml(session, { title = "Quiz Review" } = {}) {
     key: session.key,
     initialChat: session.chat || [],
   });
-  const diffHtml = renderDiffHtml(session.diff_text, session.quiz.questions || []);
+  const files = parseDiffForDisplay(session.diff_text);
+  assignHunkDomIds(files);
+  const diffHtml = renderDiffHtml(files, session.quiz.questions || []);
+  const explainerHtml = renderExplainerHtml(session.quiz, files);
   const stat = session.diff_stat || { files_changed: 0, insertions: 0, deletions: 0 };
   const score = session.score || { answered: 0, correct: 0, total: 0 };
   const summary = session.quiz.diff_summary ? `<p class="diff-summary">${escapeHtml(session.quiz.diff_summary)}</p>` : "";
@@ -648,7 +722,7 @@ export function createChromeHtml(session, { title = "Quiz Review" } = {}) {
 </head>
 <body class="quiz">
 <div class="bar"><div class="brand"><span class="brand-mark">Quiz</span><span class="brand-support">AXI</span></div><div class="spacer" aria-hidden="true"></div><div class="score-readout" id="scoreReadout">Score: ${score.correct}/${score.total}</div><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${MORE_ICON}</button><div class="menu more-menu" id="moreMenu" hidden><button class="menu-item" id="copyDiff" type="button">Copy diff</button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">End session</button></div></div></div>
-<div class="layout"><div class="frame"><div class="diff-meta">${summary}<p class="diff-stat">${stat.files_changed} file(s) changed, +${stat.insertions} -${stat.deletions}</p></div><div class="diff-view" id="diffView">${diffHtml}</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from quiz-axi.</div><textarea id="chatInput" placeholder="Ask a question about this change..."></textarea><div class="send-hint" id="sendHint" hidden>Write a question first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">Send &amp; End</button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><div class="diff-meta">${summary}<p class="diff-stat">${stat.files_changed} file(s) changed, +${stat.insertions} -${stat.deletions}</p></div>${explainerHtml}<div class="diff-view" id="diffView">${diffHtml}</div></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from quiz-axi.</div><textarea id="chatInput" placeholder="Ask a question about this change..."></textarea><div class="send-hint" id="sendHint" hidden>Write a question first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">Send &amp; End</button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card" id="endedCard"><div class="ended-title" id="endedTitle">Session ended.</div><p class="ended-copy" id="endedCopy">Return to your agent to continue.</p></div></div>
 <script id="quiz-session" type="application/json">${sessionJson}</script>
 <script id="diff-raw" type="text/plain">${escapeHtml(session.diff_text || "")}</script>
