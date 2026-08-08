@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { serve } from "../src/server.js";
+import { readdir } from "node:fs/promises";
+
+import { CLIENT_MODULES, STATIC_ASSETS, serve } from "../src/server.js";
 
 const QUIZ = {
   version: 1,
@@ -425,6 +427,52 @@ test("guided tour decisions: a decision with an unmatched hunk_anchor degrades g
   });
 });
 
+test("grounding notice: claims anchored to a file outside the diff are counted and named on the page", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "groundingnoticekey1";
+    const quiz = {
+      version: 3,
+      questions: [],
+      significance: "trivial",
+      explainer: {
+        summary: "x",
+        walkthrough: [
+          { text: "grounded step", hunk_anchor: { file: "f.js", start_line: 1, end_line: 2 } },
+          { text: "step about work that is not here", hunk_anchor: { file: "ghost.js", start_line: 1, end_line: 2 } },
+        ],
+      },
+      decisions: [{ id: "d1", decision: "stale anchor", hunk_anchor: { file: "f.js", start_line: 900, end_line: 901 } }],
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(html, /2 claims here point at code that isn't in this diff/);
+    assert.match(html, /ghost\.js<\/code> - not in this diff at all/);
+    assert.match(html, /lines 900-901 match no hunk/);
+    assert.match(html, /step about work that is not here/);
+  });
+});
+
+test("grounding notice: absent entirely when every supplied anchor matches a real hunk", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "groundingcleankey12";
+    const quiz = {
+      version: 3,
+      questions: [],
+      significance: "trivial",
+      explainer: {
+        summary: "x",
+        walkthrough: [
+          { text: "grounded", hunk_anchor: { file: "f.js", start_line: 1, end_line: 2 } },
+          { text: "unanchored prose is not a grounding failure", hunk_anchor: null },
+        ],
+      },
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.equal(html.includes("grounding-notice"), false);
+  });
+});
+
 test("guided tour uncovered hunks: a hunk no walkthrough step anchors to gets its own stop listing exactly that hunk", async () => {
   await withServer(async (baseUrl) => {
     const key = "uncoveredkey1234567";
@@ -496,5 +544,61 @@ test("ending a session as the agent resolves an in-flight poll with status ended
     const poll = await pollPromise;
     assert.equal(poll.status, "ended");
     assert.equal(poll.ended_by, "agent");
+  });
+});
+
+// The client is loaded as <script type="module">, and a module graph ABORTS on a failed
+// import - one 404 leaves a blank page rather than the "no JS, still readable" degradation a
+// classic script gave. So every relative specifier the client actually imports has to resolve
+// to a served route. This test is the only thing standing between a forgotten STATIC_ASSETS
+// entry and a page that renders nothing.
+async function clientImportSpecifiers() {
+  const roots = ["../src/chrome-client.js"];
+  for (const name of CLIENT_MODULES) roots.push(`../src/client/${name}`);
+  const found = new Set();
+  for (const rel of roots) {
+    const source = await readFile(new URL(rel, import.meta.url), "utf8");
+    for (const match of source.matchAll(/^\s*import\s[^"']*["'](\.[^"']+)["']/gm)) {
+      // "./client/tour.js" from chrome-client.js -> "/client/tour.js"; a sibling import from
+      // inside src/client/ resolves the same way.
+      found.add(new URL(match[1], new URL(rel, import.meta.url)).pathname.replace(/^.*\/src\//, "/").replace("/client/", "/client/"));
+    }
+  }
+  return [...found];
+}
+
+test("served modules: every relative import in the client resolves to a served route", async () => {
+  const specifiers = await clientImportSpecifiers();
+  assert.ok(specifiers.length > 0, "expected the client to import at least one module");
+  await withServer(async (baseUrl) => {
+    for (const route of specifiers) {
+      assert.ok(STATIC_ASSETS.has(route), `${route} is imported by the client but missing from STATIC_ASSETS`);
+      const res = await fetch(`${baseUrl}${route}`);
+      assert.equal(res.status, 200, `${route} did not serve`);
+      assert.match(res.headers.get("content-type") || "", /javascript/, `${route} served a non-JS content type`);
+    }
+  });
+});
+
+// The reverse direction: a module added to src/client/ but never listed is not served, so the
+// first import of it would blank the page at runtime instead of failing here.
+test("served modules: every file in src/client/ is listed in CLIENT_MODULES", async () => {
+  const onDisk = (await readdir(new URL("../src/client", import.meta.url))).filter((name) => name.endsWith(".js"));
+  assert.deepEqual(onDisk.sort(), [...CLIENT_MODULES].sort());
+});
+
+test("served modules: the page loads the client as a module, not a classic script", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "modulescripttagkey1";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: QUIZ });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(html, /<script type="module" src="\/chrome-client\.js"><\/script>/);
+  });
+});
+
+test("served modules: an unlisted path under /client/ is not served", async () => {
+  await withServer(async (baseUrl) => {
+    assert.equal((await fetch(`${baseUrl}/client/nope.js`)).status, 404);
+    assert.equal((await fetch(`${baseUrl}/client/../session-store.js`)).status, 404);
   });
 });

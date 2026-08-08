@@ -1,5 +1,13 @@
 /* global EventSource, document, window, CSS */
 
+// Loaded as an ES module (<script type="module">), so these specifiers are fetched by the
+// browser from /client/*.js - the same files node:test imports. Pure logic lives there and is
+// unit-tested; this file is the DOM and network layer around it.
+import { escapeHtml } from "./client/text.js";
+import { createSubmitCoalescer } from "./client/submit-queue.js";
+import { TOUR_MUST_VISIT_KINDS, maxReachableTourIndex as computeMaxReachable, tourRailIcon as railIcon, tourRailKindClass } from "./client/tour.js";
+import { endedOutcomeCopy, isTypingTarget } from "./client/ui-copy.js";
+
 const sessionDataElement = document.getElementById("quiz-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
@@ -52,25 +60,9 @@ const queued = loadQueuedPrompts();
 let ended = false;
 let agentPresence = "waiting";
 let workingBubble = null;
-let submitQueuedPromise = null;
-let submitQueuedAgain = false;
 let endAfterSubmit = false;
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let sendHintTimer;
-
-function escapeHtml(value) {
-  return String(value).replace(
-    /[&<>"']/g,
-    (char) =>
-      ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;",
-      })[char],
-  );
-}
 
 function loadQueuedPrompts() {
   try {
@@ -243,33 +235,25 @@ function sendQueued(endAfter) {
   submitQueued();
 }
 
-async function submitQueued() {
-  if (submitQueuedPromise) {
-    submitQueuedAgain = true;
-    return submitQueuedPromise;
-  }
-  let succeeded = false;
-  submitQueuedPromise = submitQueuedOnce();
-  try {
-    const result = await submitQueuedPromise;
-    succeeded = true;
-    return result;
-  } finally {
-    submitQueuedPromise = null;
-    const shouldSubmitAgain = submitQueuedAgain;
-    submitQueuedAgain = false;
+// The coalescing itself lives in ./client/submit-queue.js (and is unit-tested there); what
+// stays here is the part that reads this file's shared mutable state - the queue, `ended`, and
+// the pending-end flag.
+const submitQueued = createSubmitCoalescer({
+  submitOnce: () => submitQueuedOnce(),
+  onSettled: ({ succeeded, shouldSubmitAgain, resubmit }) => {
     if (!succeeded) {
       endAfterSubmit = false;
-    } else if (!ended && shouldSubmitAgain) {
-      if (queued.length) {
-        submitQueued();
-      } else if (endAfterSubmit) {
-        endAfterSubmit = false;
-        endSession();
-      }
+      return;
     }
-  }
-}
+    if (ended || !shouldSubmitAgain) return;
+    if (queued.length) {
+      resubmit();
+    } else if (endAfterSubmit) {
+      endAfterSubmit = false;
+      endSession();
+    }
+  },
+});
 
 async function submitQueuedOnce() {
   const prompts = queued.slice();
@@ -318,19 +302,11 @@ function markSessionEnded({ outcome } = {}) {
 
 function applyEndedMessage(outcome) {
   if (!endedTitle || !endedCopy || !endedCard) return;
+  const { className, title, copy } = endedOutcomeCopy(outcome);
   endedCard.classList.remove("outcome-passed", "outcome-failed");
-  if (outcome === "passed") {
-    endedCard.classList.add("outcome-passed");
-    endedTitle.textContent = "All correct! Review passed.";
-    endedCopy.textContent = "This diff is now clear to push. You can close this tab and return to your terminal.";
-  } else if (outcome === "failed") {
-    endedCard.classList.add("outcome-failed");
-    endedTitle.textContent = "Review marked failed.";
-    endedCopy.textContent = "See your agent's notes in the conversation panel, or in your terminal. You can close this tab.";
-  } else {
-    endedTitle.textContent = "Session ended.";
-    endedCopy.textContent = "Return to your agent to continue.";
-  }
+  if (className) endedCard.classList.add(className);
+  endedTitle.textContent = title;
+  endedCopy.textContent = copy;
 }
 
 function attemptAutoClose(outcome) {
@@ -532,39 +508,15 @@ function setTourVerdict(questionId, verdict) {
   if (tourSteps.length) refreshTourStepChrome();
 }
 
-const TOUR_MUST_VISIT_KINDS = new Set(["decision", "decisions-group", "uncovered"]);
-
-// Reading is never gated - you can always look back at anything, and the raw-diff escape
-// hatch docked at the bottom of the rail is always open. Only ADVANCING is gated: the first
-// unresolved checkpoint (not yet graded correct) or not-yet-visited decision/uncovered stop is
-// a hard wall nothing past it is reachable, computed fresh every time (never cached) so a
-// grade arriving mid-browse immediately opens the path forward.
+// Thin bindings over ./client/tour.js: the gate and the glyph choices are pure and tested
+// there, and these just hand them this file's live state. Recomputed on every call, never
+// cached - a grade arriving mid-browse has to open the path forward immediately.
 function maxReachableTourIndex() {
-  for (let index = 0; index < tourSteps.length; index += 1) {
-    const step = tourSteps[index];
-    if (step.kind === "checkpoint" && tourVerdictByQuestionId[step.question_id] !== "correct") return index;
-    if (TOUR_MUST_VISIT_KINDS.has(step.kind) && !tourVisitedIndices.has(index)) return index;
-  }
-  return tourSteps.length - 1;
+  return computeMaxReachable(tourSteps, { verdicts: tourVerdictByQuestionId, visited: tourVisitedIndices });
 }
 
 function tourRailIcon(step, index, maxReachable) {
-  if (index > maxReachable) return "🔒";
-  if (step.kind === "checkpoint") {
-    const verdict = tourVerdictByQuestionId[step.question_id];
-    if (verdict === "correct") return "✓";
-    if (verdict === "incorrect") return "✕";
-    return "◇";
-  }
-  if (step.kind === "uncovered") return "▨";
-  if (TOUR_MUST_VISIT_KINDS.has(step.kind)) return "◈";
-  if (index === tourIndex) return "▸";
-  if (index < tourIndex) return "✓";
-  return step.kind === "grade" ? "⚑" : "";
-}
-
-function tourRailKindClass(step) {
-  return TOUR_MUST_VISIT_KINDS.has(step.kind) ? " tour-rail-decision" : "";
+  return railIcon(step, index, { maxReachable, currentIndex: tourIndex, verdicts: tourVerdictByQuestionId });
 }
 
 function renderTourRail() {
@@ -777,11 +729,6 @@ function exitTourMode() {
   tourActive = false;
   tourMode.hidden = true;
   if (fullReview) fullReview.hidden = false;
-}
-
-function isTypingTarget(el) {
-  const tag = el && el.tagName;
-  return tag === "TEXTAREA" || tag === "INPUT" || (el && el.isContentEditable);
 }
 
 if (tourMode && tourSteps.length) {

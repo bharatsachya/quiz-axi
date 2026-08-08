@@ -4,10 +4,24 @@ import { readFile } from "node:fs/promises";
 import express from "express";
 
 import { bindHost, hostForUrl, linkHost } from "./paths.js";
+import { collectUngroundedAnchors } from "./quiz.js";
 import { SessionStore } from "./session-store.js";
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
 const chromeCssUrl = new URL("./chrome.css", import.meta.url);
+
+// Browser-side ES modules under src/client/, imported by chrome-client.js and served at the
+// same relative paths so one specifier ("./client/tour.js") resolves identically in Node and
+// in the browser. Adding a module means adding its name here.
+export const CLIENT_MODULES = ["text.js", "tour.js", "ui-copy.js", "submit-queue.js"];
+
+// An explicit allowlist, never a path built from the request. `readFile(new URL(req.params.x,
+// dirUrl))` would happily walk out of src/ with a ../ and serve anything readable.
+export const STATIC_ASSETS = new Map([
+  ["/chrome.css", [chromeCssUrl, "text/css"]],
+  ["/chrome-client.js", [chromeClientUrl, "application/javascript"]],
+  ...CLIENT_MODULES.map((name) => [`/client/${name}`, [new URL(`./client/${name}`, import.meta.url), "application/javascript"]]),
+]);
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
 
@@ -335,21 +349,15 @@ export async function serve({
     }
   });
 
-  app.get("/chrome-client.js", async (req, res, next) => {
-    try {
-      res.type("application/javascript").send(await readFile(chromeClientUrl, "utf8"));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.get("/chrome.css", async (req, res, next) => {
-    try {
-      res.type("text/css").send(await readFile(chromeCssUrl, "utf8"));
-    } catch (error) {
-      next(error);
-    }
-  });
+  for (const [route, [assetUrl, contentType]] of STATIC_ASSETS) {
+    app.get(route, async (req, res, next) => {
+      try {
+        res.type(contentType).send(await readFile(assetUrl, "utf8"));
+      } catch (error) {
+        next(error);
+      }
+    });
+  }
 
   app.use((error, req, res, _next) => {
     const status = Number(error?.statusCode || error?.status) || 500;
@@ -615,6 +623,27 @@ function renderDecisionItem(decision, files) {
       : "";
   const why = decision.why ? `<div class="decision-why">${escapeHtml(decision.why)}</div>` : "";
   return `<li class="decision-item${linkClass}"${linkAttrs}><span class="decision-badge ${badgeClass}">${badgeText}</span><div class="decision-body"><div class="decision-text">${escapeHtml(decision.decision)}</div>${why}${alternatives}</div></li>`;
+}
+
+// The counted half of the grounding check: says out loud how many of the explainer's claims
+// point at code that isn't in this diff. Without it a step whose anchor matched nothing renders
+// as ordinary unlinked prose, indistinguishable from a step that was grounded - the same
+// ambiguity the uncovered-hunks tour stop closes from the other side (there, code nobody
+// explained; here, an explanation with no code under it).
+function renderGroundingNoticeHtml(quiz, files) {
+  const ungrounded = collectUngroundedAnchors(quiz, files);
+  if (!ungrounded.length) return "";
+  const items = ungrounded
+    .map((entry) => {
+      const reason =
+        entry.reason === "file-not-in-diff"
+          ? "not in this diff at all"
+          : `lines ${entry.start_line}-${entry.end_line} match no hunk`;
+      return `<li><code>${escapeHtml(entry.file)}</code> - ${escapeHtml(reason)}<span class="grounding-claim">${escapeHtml(entry.label)}</span></li>`;
+    })
+    .join("");
+  const count = ungrounded.length;
+  return `<details class="grounding-notice"><summary>${count} claim${count === 1 ? "" : "s"} here point${count === 1 ? "s" : ""} at code that isn't in this diff</summary><ul class="grounding-list">${items}</ul></details>`;
 }
 
 // Renders the ladder above the split diff: eli5 (plainest, most prominent) first, then
@@ -913,6 +942,10 @@ export function createChromeHtml(session, { title = "Quiz Review" } = {}) {
   // as a whole; it starts hidden whenever a tour exists (the tour is the default landing
   // view), and is the only thing rendered at all when there's no tour to show.
   const fullReview = `<div class="diff-meta">${summary}<p class="diff-stat">${stat.files_changed} file(s) changed, +${stat.insertions} -${stat.deletions}</p></div>${explainerHtml}<div class="diff-view" id="diffView">${diffHtml}</div>`;
+  // Sits outside the fullReview/tour toggle, not inside the explainer block: it is a caveat
+  // about the whole artifact, and the tour (the default landing view) hides fullReview
+  // entirely - a trust signal only visible in the mode the reader didn't pick isn't one.
+  const groundingHtml = renderGroundingNoticeHtml(session.quiz, files);
   return `<!doctype html>
 <html>
 <head>
@@ -923,11 +956,11 @@ export function createChromeHtml(session, { title = "Quiz Review" } = {}) {
 </head>
 <body class="quiz">
 <div class="bar"><div class="brand"><span class="brand-mark">Quiz</span><span class="brand-support">AXI</span></div><div class="spacer" aria-hidden="true"></div>${tourToggle}<div class="score-readout" id="scoreReadout">Score: ${score.correct}/${score.total}</div><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${MORE_ICON}</button><div class="menu more-menu" id="moreMenu" hidden><button class="menu-item" id="copyDiff" type="button">Copy diff</button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">End session</button></div></div></div>
-<div class="layout"><div class="frame"><div id="fullReview"${tour.length > 0 ? " hidden" : ""}>${fullReview}</div>${tourShell}</div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from quiz-axi.</div><textarea id="chatInput" placeholder="Ask a question about this change..."></textarea><div class="send-hint" id="sendHint" hidden>Write a question first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">Send &amp; End</button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame">${groundingHtml}<div id="fullReview"${tour.length > 0 ? " hidden" : ""}>${fullReview}</div>${tourShell}</div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from quiz-axi.</div><textarea id="chatInput" placeholder="Ask a question about this change..."></textarea><div class="send-hint" id="sendHint" hidden>Write a question first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">Send &amp; End</button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card" id="endedCard"><div class="ended-title" id="endedTitle">Session ended.</div><p class="ended-copy" id="endedCopy">Return to your agent to continue.</p></div></div>
 <script id="quiz-session" type="application/json">${sessionJson}</script>
 <script id="diff-raw" type="text/plain">${escapeHtml(session.diff_text || "")}</script>
-<script src="/chrome-client.js"></script>
+<script type="module" src="/chrome-client.js"></script>
 </body>
 </html>`;
 }

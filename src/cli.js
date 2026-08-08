@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 
 import { AxiError, installSessionStartHooks, runAxiCli } from "axi-sdk-js";
 
-import { computeCurrentDiff, computeRangeDiff, diffKey, parsePrePushStdin } from "./diff.js";
+import { computeCurrentDiff, computeRangeDiff, diffKey, parseDiffHunks, parsePrePushStdin } from "./diff.js";
 import { clientHost, defaultPort, ensureStateDir, hostForUrl, serverLogFile, stateFile } from "./paths.js";
-import { loadQuizSpec, matchHunkAnchors } from "./quiz.js";
+import { collectUngroundedAnchors, loadQuizSpec, matchHunkAnchors } from "./quiz.js";
 import { serve } from "./server.js";
 import { SessionStore } from "./session-store.js";
 
@@ -33,11 +33,15 @@ const CODEX_POLL_WAKE_PATH_GUIDANCE =
 // server is still up silently keeps serving the OLD in-memory code indefinitely. Folding in the
 // latest mtime across src/+bin/ makes every source edit change VERSION, so the next CLI
 // invocation always detects the mismatch and restarts the stale server automatically.
+// Recursive: browser-side ES modules live in src/client/, and a flat scan would skip that
+// directory entirely (its entry has no .js/.css extension). The failure mode is silent and
+// nasty - editing a client module would never change VERSION, so ensureServer() would keep an
+// already-running detached server alive and go on serving the OLD code with no error anywhere.
 function computeSourceFingerprint() {
   let latestMtimeMs = 0;
   for (const dirUrl of [new URL("../src", import.meta.url), new URL("../bin", import.meta.url)]) {
     const dir = fileURLToPath(dirUrl);
-    for (const entry of readdirSync(dir)) {
+    for (const entry of readdirSync(dir, { recursive: true })) {
       if (!entry.endsWith(".js") && !entry.endsWith(".css")) continue;
       const mtimeMs = statSync(path.join(dir, entry)).mtimeMs;
       if (mtimeMs > latestMtimeMs) latestMtimeMs = mtimeMs;
@@ -147,6 +151,7 @@ async function reviewCommand(args) {
   }
   const rawQuiz = await loadQuizSpec(quizPath);
   const quiz = matchHunkAnchors(rawQuiz, diffText);
+  const ungrounded = collectUngroundedAnchors(quiz, parseDiffHunks(diffText));
   const key = diffKey({ repoRoot, diffText });
   const baseUrl = await ensureServer();
   const response = await postJson(`${baseUrl}/api/sessions`, {
@@ -164,7 +169,7 @@ async function reviewCommand(args) {
       response.status = "ready";
     }
   }
-  return createReviewOutput({ diffKey: key, url: response.url, status: response.status || "opened" });
+  return createReviewOutput({ diffKey: key, url: response.url, status: response.status || "opened", ungrounded });
 }
 
 export function shouldOpenBrowser(args, env) {
@@ -181,10 +186,32 @@ export function createSelfAuthoredOutput({ diffKey: key }) {
   };
 }
 
-export function createReviewOutput({ diffKey: key, url, status }) {
+// The review page names every ungrounded anchor to the human, so the agent is told about them
+// too, on the one turn it can still do something about it. Deliberately not fatal: the review
+// is already open and the prose is still worth reading - but an anchor pointing at a file the
+// diff never touched usually means the explainer describes work that isn't in this changeset,
+// which is worth a second look before the human is quizzed on it.
+export function createReviewOutput({ diffKey: key, url, status, ungrounded = [] }) {
+  const invented = ungrounded.filter((entry) => entry.reason === "file-not-in-diff").length;
+  const stale = ungrounded.length - invented;
+  const groundingNote = ungrounded.length
+    ? `Heads up before you poll: ${ungrounded.length} hunk_anchor(s) in this quiz.json point at nothing in the real ` +
+      `diff` +
+      (invented ? `, ${invented} of them naming a file the changeset never touched` : "") +
+      (invented && stale ? ` and ${stale} with a line range matching no hunk` : "") +
+      `. The human sees them flagged on the review page. If an anchor names a file that isn't here, check whether ` +
+      `the explainer is describing work outside this diff; if the line range is just stale, fix it and re-run ` +
+      `\`review\`. See \`review.grounding.ungrounded_anchors\` for which ones. `
+    : "";
   return {
-    review: { diff_key: key, url, status },
+    review: {
+      diff_key: key,
+      url,
+      status,
+      ...(ungrounded.length ? { grounding: { ungrounded_anchors: ungrounded } } : {}),
+    },
     next_step:
+      groundingNote +
       `Do not respond to the user just yet. Now you must run \`quiz-axi poll ${key}\`. This long-polls until the ` +
       `human answers a question, asks a free-text question back, or ends the session, and it stays silent the whole ` +
       `time - that is normal, never kill it. Grade each answered question live with \`quiz-axi grade ${key} ` +

@@ -74,11 +74,14 @@ The explainer is the product; the quiz is just the receipt. Write it like catchi
 
 ## Write questions that aren't punishment
 
-Draw questions from three sources, in order of value:
+**Finish the explainer first, then write the questions in a separate pass, reading only the explainer.** Not a style preference - write both at once and you will reliably ask about things the prose never actually said, because you are drawing on everything you know about the change rather than on what you told the reader. A question the explainer doesn't answer teaches nothing and just makes the human feel stupid, which is how a review gate starts getting bypassed. So: write the explainer, stop, re-read it as if you had not made the change, and write questions only from what is on the page.
+
+Draw questions from four sources, in order of value:
 
 1. **Decisions** - "why X instead of Y?", with the rejected alternatives from the journal as the wrong choices. These are the best questions available: the distractors are maximally plausible because they were genuinely considered, and they test *why*, not *what*.
 2. **Consequences** - "what happens now that didn't happen before?" - answerable from the `eli5` and `summary` alone.
-3. **Mechanics** - hunk-anchored questions about how the code does it. Use these only at `high` significance.
+3. **Behavior change** - name a *concrete input* on which the old code and the new code do different things, and ask what the new one does with it ("a request arrives with no `Retry-After` header - what happens now?"). Prefer this over anything abstract: "is this risky?" produces prose nobody can check, while a concrete input is falsifiable, and it usually converts straight into a regression test. Only ask it when the explainer actually taught the rule that decides the answer.
+4. **Mechanics** - hunk-anchored questions about how the code does it. Use these only at `high` significance.
 
 At least one question in every review must be passable by someone who read *only* the `eli5` rung - that is what keeps the zero-background promise honest.
 
@@ -136,8 +139,9 @@ There is still no answer-key field: grading is always live, done by you, never a
 ## Workflow
 
 1. `git add` any new files that are part of the change. This matters: quiz-axi's diff deliberately excludes untracked (never `git add`ed) files, so the reviewed diff always matches what a later `git push` actually sends. Anything you don't stage will silently not appear in the review.
-2. Size the change (table above), then assemble `quiz.json` outside the repo from your decision journal: write the `eli5` rung first (it is your own comprehension check), then the rest of the explainer, then prune journal entries into `decisions`, then questions - decisions-sourced questions first.
+2. Size the change (table above), then assemble `quiz.json` outside the repo from your decision journal, in this order: write the `eli5` rung first (it is your own comprehension check), then the rest of the explainer, then prune journal entries into `decisions`. Stop there and re-read what you have written, as if you had not made the change. Only then write the `questions`, from that text alone - decisions-sourced questions first. The order is the point (see above); doubling back to add explainer material because a question needed it is fine, writing a question the explainer never covered is not.
 3. Run `node bin/quiz-axi.js review --quiz <path-to-quiz.json> [--base <ref>]` to open a review session in the browser, and note the `diff_key` it prints - every later command needs it. `--base` picks the branch to diff against; it defaults to the current branch's upstream, then `origin/HEAD`/`origin/main`/`origin/master`, then local `main`/`master`.
+   - If the output carries `review.grounding`, some `hunk_anchor` you wrote points at nothing in the real diff, and the human sees it flagged on the review page. `file-not-in-diff` is the serious one - it usually means the explainer describes work that isn't in this changeset, so check that before the human reads it. `no-matching-hunk` is usually just a line range that went stale while you kept editing; fix the numbers and re-run `review`. Leaving an anchor unset is always fine - only a wrong one is reported.
 4. For a `trivial` review: seal it immediately - `node bin/quiz-axi.js grade <diff_key> --finish pass --summary "trivial: <one line>"` - then `end`. No quiz, no poll loop. The summary still lands in the record the human can see.
 5. Otherwise, do not respond to the user yet. Immediately run `node bin/quiz-axi.js poll <diff_key>`. This long-polls silently until the human answers, asks something, or ends the session - leave it running, never kill it.
    - Keep the poll in the foreground by default and let it return activity directly to you.
