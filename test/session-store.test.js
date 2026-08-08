@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -18,8 +19,8 @@ const QUIZ = {
 async function withStore(fn) {
   const dir = await mkdtemp(path.join(tmpdir(), "quiz-axi-store-"));
   try {
-    const store = new SessionStore(path.join(dir, "state.json"));
-    await fn(store);
+    const file = path.join(dir, "state.json");
+    await fn(new SessionStore(file), file);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -301,5 +302,68 @@ test("a quiz-graded pass is marked method quiz, distinguishing it from a self-au
     await store.finishGrading("key1", { result: "pass" });
     const record = await store.findReviewIndex("key1");
     assert.equal(record.method, "quiz");
+  });
+});
+
+// Every method here is a read-modify-write of the WHOLE state file. Before the mutation queue,
+// two overlapping awaits each read the same starting state and the later write discarded the
+// earlier one - or interleaved mid-write and left torn JSON that every later command, INCLUDING
+// the pre-push hook, crashed on. This is that exact interleaving.
+test("concurrent mutations neither lose updates nor tear the state file", async () => {
+  await withStore(async (store, file) => {
+    await store.upsertSession("racekey", {
+      repoRoot: "/repo",
+      url: "u",
+      diffText: "d",
+      diffStat: {},
+      quiz: { version: 1, questions: [{ id: "q1", type: "free-text", prompt: "p" }] },
+    });
+
+    const ops = [];
+    for (let i = 0; i < 25; i += 1) {
+      ops.push(store.addAgentReply("racekey", `reply ${i}`));
+      ops.push(store.queuePrompts("racekey", { prompts: [{ uid: "", prompt: `question ${i}`, selector: "", tag: "message", text: "" }] }));
+    }
+    await Promise.all(ops);
+
+    const session = await store.findByKey("racekey");
+    assert.equal(session.chat.length, 50, "every message must survive - none silently overwritten");
+    // And the file itself is still readable, which is what the git hook depends on.
+    assert.doesNotThrow(() => JSON.parse(readFileSync(file, "utf8")));
+  });
+});
+
+test("a mutation that throws does not wedge the queue for later ones", async () => {
+  await withStore(async (store) => {
+    await store.upsertSession("wedgekey", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: { version: 1, questions: [] } });
+    // gradeQuestion throws for an unanswered question; the next mutation must still run.
+    await assert.rejects(store.gradeQuestion("wedgekey", { questionId: "nope", verdict: "correct", feedback: "" }));
+    const result = await store.addAgentReply("wedgekey", "still works");
+    assert.equal(result.session.chat.at(-1).text, "still works");
+  });
+});
+
+test("a corrupt state file reports which file and how to recover, rather than a raw parse error", async () => {
+  await withStore(async (store, file) => {
+    writeFileSync(file, '{"sessions":{}} trailing garbage');
+    await assert.rejects(store.findReviewIndex("k"), (error) => {
+      assert.equal(error.code, "VALIDATION_ERROR");
+      assert.match(error.message, /state file is corrupt/);
+      assert.match(error.suggestions.join(" "), new RegExp(`rm ${file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+      return true;
+    });
+  });
+});
+
+// A half-written file is what bricks the tool, so writes land via rename(2) rather than in
+// place. A reader sees the whole old file or the whole new one, never something in between.
+test("writes are atomic and leave no temp files behind", async () => {
+  await withStore(async (store, file) => {
+    await store.upsertSession("atomickey", { repoRoot: "/repo", url: "u", diffText: "d", diffStat: {}, quiz: { version: 1, questions: [] } });
+    const dir = path.dirname(file);
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes(".tmp")),
+      [],
+    );
   });
 });

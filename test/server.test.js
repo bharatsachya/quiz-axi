@@ -195,10 +195,12 @@ test("the diff renders as a GitHub-style split view: paired left/right cells wit
     // The unchanged context line appears on both sides.
     assert.equal((html.match(/>context</g) || []).length, 2);
     // The deletion appears only on the left, the two additions only on the right.
-    assert.match(html, /split-cell split-left split-del"><span class="split-ln">2<\/span><span class="split-code">old line/);
-    assert.match(html, /split-cell split-right split-add"><span class="split-ln">2<\/span><span class="split-code">new line/);
+    assert.match(html, /split-cell split-left split-del" data-side="old" data-ln="2"><span class="split-ln">2<\/span><span class="split-code">old line/);
+    assert.match(html, /split-cell split-right split-add" data-side="new" data-ln="2"><span class="split-ln">2<\/span><span class="split-code">new line/);
     assert.match(html, /split-cell split-left split-empty/);
-    assert.match(html, /split-cell split-right split-add"><span class="split-ln">3<\/span><span class="split-code">extra added line/);
+    assert.match(html, /split-cell split-right split-add" data-side="new" data-ln="3"><span class="split-ln">3<\/span><span class="split-code">extra added line/);
+    // A padding cell has no line to anchor to, so it carries no anchor attributes at all.
+    assert.match(html, /split-cell split-left split-empty"><\/div>/);
   });
 });
 
@@ -600,5 +602,296 @@ test("served modules: an unlisted path under /client/ is not served", async () =
   await withServer(async (baseUrl) => {
     assert.equal((await fetch(`${baseUrl}/client/nope.js`)).status, 404);
     assert.equal((await fetch(`${baseUrl}/client/../session-store.js`)).status, 404);
+  });
+});
+
+test("theme: the bootstrap runs in <head> BEFORE the stylesheet, or dark readers get a white flash", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "themebootstrapkey1";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: QUIZ });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    const bootstrapAt = html.indexOf("localStorage.getItem");
+    const stylesheetAt = html.indexOf('<link rel="stylesheet"');
+    const headEndsAt = html.indexOf("</head>");
+    assert.ok(bootstrapAt > 0, "expected an inline theme bootstrap");
+    assert.ok(bootstrapAt < stylesheetAt, "bootstrap must precede the stylesheet");
+    assert.ok(bootstrapAt < headEndsAt, "bootstrap must be inside <head>");
+    // Synchronous: defer/async would run it after the first paint, defeating the whole point.
+    assert.doesNotMatch(html.slice(bootstrapAt - 60, bootstrapAt), /<script[^>]*\b(defer|async)\b/);
+  });
+});
+
+// The hazard this guards is a real one in the project this was ported from: the storage key
+// lived as two separate string literals, free to drift, and the symptom was a theme choice
+// that survived a reload only sometimes.
+test("theme: the bootstrap and the client are handed the same storage key", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "themestoragekey123";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: QUIZ });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    const inBootstrap = html.match(/localStorage\.getItem\("([^"]+)"\)/);
+    const session = JSON.parse(html.match(/<script id="quiz-session" type="application\/json">([\s\S]*?)<\/script>/)[1]);
+    assert.ok(inBootstrap, "expected the bootstrap to read a storage key");
+    assert.equal(inBootstrap[1], session.themeStorageKey);
+  });
+});
+
+test("theme: the bootstrap only honours the two known values, never arbitrary stored text", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "themevalidationkey";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: QUIZ });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(html, /t==="dark"\|\|t==="light"/);
+  });
+});
+
+test("theme: the toggle renders even for a trivial review with no guided tour", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "themetrivialkey123";
+    await postJson(`${baseUrl}/api/sessions`, {
+      key,
+      repo_root: "/repo",
+      diff_text: DIFF_TEXT,
+      diff_stat: {},
+      quiz: { version: 3, significance: "trivial", questions: [] },
+    });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(html, /data-theme-toggle/);
+    assert.doesNotMatch(html, /id="tourToggle"/);
+  });
+});
+
+const ANCHOR_QUIZ = {
+  version: 3,
+  significance: "normal",
+  explainer: {
+    eli5: "Plain words about the change.",
+    summary: "What changed and why.",
+    walkthrough: [{ text: "The first step of the change." }, { text: "The second step of the change." }],
+  },
+  decisions: [{ id: "d1", who: "agent", decision: "Chose X over Y", why: "Because of Z", alternatives: ["Y"] }],
+  questions: [{ id: "q1", type: "free-text", prompt: "Why X?" }],
+};
+
+test("anchor blocks: every prose block the reader can highlight gets a stable id", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "anchorblockskey123";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    for (const id of ["blk-eli5", "blk-explainer-summary", "blk-step-0", "blk-step-1", "blk-dec-d1-text", "blk-dec-d1-why", "blk-dec-d1-alts", "blk-q-q1-prompt"]) {
+      assert.match(html, new RegExp(`data-anchor-block="${id}"`), `missing anchor block ${id}`);
+    }
+  });
+});
+
+// The <li> wrapper's textContent includes the step number and the Agent/Human badge; anchoring
+// there would put those characters into every offset.
+test("anchor blocks: the id sits on the prose element, not the list item around it", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "anchorinnerkey1234";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    assert.match(html, /<span class="walkthrough-text" data-anchor-block="blk-step-0"/);
+    assert.match(html, /<div class="decision-text" data-anchor-block="blk-dec-d1-text"/);
+    assert.doesNotMatch(html, /<li class="walkthrough-step[^>]*data-anchor-block/);
+  });
+});
+
+test("anchor blocks: ids are deterministic across renders", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "anchorstablekey123";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    const first = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    const second = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    const ids = (html) => [...html.matchAll(/data-anchor-block="([^"]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(ids(first), ids(second));
+  });
+});
+
+test("anchor blocks: two identical decision texts get distinct ids rather than colliding", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "anchorcollidekey12";
+    const quiz = {
+      version: 3,
+      questions: [],
+      significance: "trivial",
+      decisions: [
+        { id: "same", who: "agent", decision: "Identical text", why: "" },
+        { id: "same!", who: "agent", decision: "Identical text", why: "" },
+      ],
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz });
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res) => res.text());
+    const ids = [...html.matchAll(/data-anchor-block="([^"]+)"/g)].map((m) => m[1]);
+    assert.equal(new Set(ids).size, ids.length, `expected unique ids, got ${ids.join(", ")}`);
+  });
+});
+
+async function anchoredQuestion(baseUrl, key, anchor, threadId = "t-abc123") {
+  return postJson(`${baseUrl}/api/${key}/prompts`, {
+    prompts: [
+      {
+        uid: "",
+        prompt: "what does this mean?",
+        selector: "",
+        tag: "message",
+        text: "Question for the agent",
+        target: { type: "message", thread_id: threadId, anchor },
+      },
+    ],
+  });
+}
+
+test("anchored question: the passage and the whole thread reach the agent's poll payload", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "anchoredaskkey1234";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    const start = "The first step".length - 5;
+    await anchoredQuestion(baseUrl, key, {
+      kind: "text",
+      block_id: "blk-step-0",
+      block_kind: "walkthrough-step",
+      start,
+      end: start + 4,
+      exact: "step",
+      prefix: "",
+      suffix: "",
+    });
+    const feedback = await fetch(`${baseUrl}/api/poll?key=${key}&timeoutMs=50`).then((res) => res.json());
+    const prompt = feedback.prompts[0];
+    assert.equal(prompt.target.thread_id, "t-abc123");
+    assert.equal(prompt.target.anchor.block_id, "blk-step-0");
+    assert.equal(prompt.thread.id, "t-abc123");
+    assert.equal(prompt.thread.quote, "step");
+    assert.deepEqual(prompt.thread.turns.map((t) => t.text), ["what does this mean?"]);
+  });
+});
+
+test("anchored question: a follow-up joins the same thread and the agent sees every earlier turn", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "anchoredfollowkey1";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    await anchoredQuestion(baseUrl, key, { kind: "block", block_id: "blk-eli5", block_kind: "eli5", exact: "Plain words about the change." });
+    await fetch(`${baseUrl}/api/poll?key=${key}&timeoutMs=50`).then((res) => res.json());
+    await postJson(`${baseUrl}/api/${key}/agent-reply`, { text: "because of X", thread_id: "t-abc123" });
+    await anchoredQuestion(baseUrl, key, null);
+
+    const feedback = await fetch(`${baseUrl}/api/poll?key=${key}&timeoutMs=50`).then((res) => res.json());
+    const turns = feedback.prompts[0].thread.turns;
+    assert.deepEqual(
+      turns.map((t) => [t.role, t.text]),
+      [
+        ["user", "what does this mean?"],
+        ["agent", "because of X"],
+        ["user", "what does this mean?"],
+      ],
+      "a bare follow-up must arrive with the whole thread, not on its own",
+    );
+    // The first turn's anchor stands for the thread; a follow-up does not overwrite it.
+    assert.equal(feedback.prompts[0].thread.anchor.block_id, "blk-eli5");
+  });
+});
+
+// Losing the agent's answer to a mistyped id is worse than filing it in the wrong place.
+test("anchored question: an unknown thread id files the reply loose and says so, never errors", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "unknownthreadkey12";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    const res = await postJson(`${baseUrl}/api/${key}/agent-reply`, { text: "an answer", thread_id: "t-nosuchthread" });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.thread_id, null);
+    assert.equal(res.body.unknown_thread, true);
+    const html = await fetch(`${baseUrl}/session/${key}`).then((res2) => res2.text());
+    assert.match(html, /an answer/, "the reply must still be readable somewhere");
+  });
+});
+
+test("anchored question: a diff anchor is rebuilt from the server's own parse, not the client's claim", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "diffanchorkey12345";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    await anchoredQuestion(baseUrl, key, {
+      kind: "diff",
+      hunk_dom_id: "hunk-0",
+      file: "f.js",
+      side: "new",
+      start_line: 2,
+      end_line: 2,
+      whole_hunk: false,
+      exact: "TOTALLY WRONG TEXT THE CLIENT MADE UP",
+    });
+    const feedback = await fetch(`${baseUrl}/api/poll?key=${key}&timeoutMs=50`).then((res) => res.json());
+    assert.equal(feedback.prompts[0].target.anchor.exact, "added line", "the server must overwrite the client's text");
+  });
+});
+
+// The one case where prose really does move under an anchor: same diff, corrected quiz.json,
+// so the diffKey and the chat survive but the explainer text does not.
+test("anchored question: a re-review that rewrites the prose marks the old anchor stale", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "staleanchorkey1234";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    const rewritten = {
+      ...ANCHOR_QUIZ,
+      explainer: { ...ANCHOR_QUIZ.explainer, walkthrough: [{ text: "Completely rewritten prose." }, { text: "The second step of the change." }] },
+    };
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: rewritten });
+    await anchoredQuestion(baseUrl, key, {
+      kind: "text",
+      block_id: "blk-step-0",
+      block_kind: "walkthrough-step",
+      start: 4,
+      end: 9,
+      exact: "first",
+      prefix: "The ",
+      suffix: " step",
+    });
+    const feedback = await fetch(`${baseUrl}/api/poll?key=${key}&timeoutMs=50`).then((res) => res.json());
+    const anchor = feedback.prompts[0].target.anchor;
+    assert.equal(anchor.stale, true, "the quote is gone from that block, so it must be flagged");
+    assert.equal(anchor.kind, "block", "and degraded to the whole block rather than pointing at new text");
+  });
+});
+
+test("anchored question: a block that no longer exists is flagged rather than dropped", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "goneblockkey123456";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    await anchoredQuestion(baseUrl, key, { kind: "text", block_id: "blk-step-99", block_kind: "walkthrough-step", start: 0, end: 4, exact: "gone" });
+    const feedback = await fetch(`${baseUrl}/api/poll?key=${key}&timeoutMs=50`).then((res) => res.json());
+    assert.equal(feedback.prompts[0].target.anchor.stale, true);
+    assert.equal(feedback.prompts[0].target.anchor.exact, "gone", "the human's quote must survive");
+  });
+});
+
+test("anchored question: a garbage anchor from the browser is rejected at the boundary", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "garbageanchorkey12";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    await anchoredQuestion(baseUrl, key, { kind: "text", block_id: "../../etc/passwd", start: -5, end: "x", exact: "y".repeat(9000) });
+    const feedback = await fetch(`${baseUrl}/api/poll?key=${key}&timeoutMs=50`).then((res) => res.json());
+    assert.equal(feedback.prompts[0].target.anchor, undefined, "a malformed block_id must not survive normalization");
+  });
+});
+
+test("anchored question: an over-long quote is capped rather than stored whole", async () => {
+  await withServer(async (baseUrl) => {
+    const key = "longquotekey123456";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    await anchoredQuestion(baseUrl, key, { kind: "block", block_id: "blk-step-99", block_kind: "k", exact: "z".repeat(9000) });
+    const feedback = await fetch(`${baseUrl}/api/poll?key=${key}&timeoutMs=50`).then((res) => res.json());
+    assert.ok(feedback.prompts[0].target.anchor.exact.length <= 2000);
+  });
+});
+
+test("threads survive a re-review of the same diff, alongside chat and answers", async () => {
+  await withServer(async (baseUrl, stateFile) => {
+    const key = "threadsurvivekey12";
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    await anchoredQuestion(baseUrl, key, { kind: "block", block_id: "blk-eli5", block_kind: "eli5", exact: "Plain words about the change." });
+    await postJson(`${baseUrl}/api/sessions`, { key, repo_root: "/repo", diff_text: DIFF_TEXT, diff_stat: {}, quiz: ANCHOR_QUIZ });
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    assert.equal(Object.keys(state.sessions[key].threads).length, 1);
+    assert.equal(state.sessions[key].chat.length, 1);
   });
 });

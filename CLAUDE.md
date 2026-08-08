@@ -21,6 +21,8 @@ A local, unpublished CLI that makes a human prove they understood an AI-authored
 | `server.js` | Local express server, long-poll endpoints, and server-side HTML rendering (split diff, explainer ladder, guided tour, question cards). |
 | `chrome-client.js` | Browser-side DOM/network layer (chat, answer submission, tour, auto-close). Loaded as `<script type="module">`. |
 | `client/*.js` | Pure browser-side logic, served at `/client/<name>.js` **and** imported by `node:test` — the tested code is the shipped code. Add a module → add its name to `CLIENT_MODULES` in `server.js`. |
+| `client/anchor.js` | Turning a text selection into an anchor, and re-finding it. Derived from pi-teach (see `NOTICE`). |
+| `client/threads.js` | Grouping the flat chat array into threads for display. |
 | `quiz.js` | Load + validate/normalize `quiz.json` (versions 1–3), match hunk anchors to the diff, and report (never silently drop) anchors that point at nothing. |
 | `paths.js` | State dir, ports, bind/link host resolution from env. |
 
@@ -31,13 +33,21 @@ A local, unpublished CLI that makes a human prove they understood an AI-authored
 - **Untracked files are excluded from the reviewed diff.** Keeps what `review` sees identical to what `git push` sends. `quiz.json` must be written *outside* the repo for this reason.
 - **Base resolution is shared** by `review`/`verify`/hook (`resolveBaseRef`): `--base`/`QUIZ_AXI_BASE_BRANCH` → `@{upstream}` → `origin/HEAD` → `origin/main` → `origin/master` → local `main` → local `master`.
 - **Grading is always live; there is no answer key.** `quiz.json` carries no correct-answer field — even an "obviously correct" multiple-choice pick only counts once the agent calls `grade`. Don't add an answer key.
+- **A human's question carries the passage it is about.** Selecting text in the review mints a thread whose anchor the server re-resolves against its own diff/quiz parse (`resolveAnchor`) — the client's offsets are never trusted, and a diff anchor's quoted text is *rebuilt* server-side. An anchor that no longer resolves is flagged `stale` and downgraded, never dropped: losing the question would be far worse than pointing imprecisely. `session.chat` stays a flat array with an optional `thread_id`, so a chat written before threads existed still renders — there is no migration anywhere, and `buildChatView`'s legacy test is what guarantees it.
 - **Claims that point at nothing are counted and shown, never silently dropped.** A `hunk_anchor` that matches no real hunk renders as ordinary unlinked prose, which looks exactly like prose that was grounded — so `collectUngroundedAnchors` reports every one, to the human on the page and to the agent in `review`'s output. Same principle as the uncovered-hunks tour stop, from the other side: there, code nobody explained; here, an explanation with no code under it.
+- **All state mutations go through `SessionStore.mutate`, and writes are atomic.** Every method is a read-modify-write of the *whole* `state.json`, so overlapping awaits would lose updates or leave torn JSON that crashes every later command — including the pre-push hook, which is how the gate gets bricked. `mutate` serializes this process's writes; `writeState` goes via temp-file + `rename` so a *cross-process* race (a CLI command racing the detached server) can lose an update but can never tear the file. Never add a method that calls `readState`/`writeState` directly to mutate.
 - **The gate needs no live server.** `verify` reads `review_index` straight off disk. Keep it that way — the hook must work with nothing running.
 
 ## Escape hatches (behavior to preserve)
 
 - `git push --no-verify` — git's own bypass, leaves no record. The human's call, never suggest it as a shortcut.
 - `review --self-authored` — seals a diff instantly with an honest `method: "self-authored"` record (vs `method: "quiz"`). For a human sealing their own hand-written change. **An agent must never run this to skip a review.**
+
+## Known limitations (not bugs to "fix" incidentally — decide deliberately)
+
+- **`takeFeedback` drains `session.prompts` before the HTTP response is confirmed delivered.** A connection dropped in that window loses the human's answer silently, which contradicts the "queued activity is never lost" line in the CLI output. Low risk over loopback; fixing it properly means acknowledging delivery rather than draining on read.
+- **`state.json` grows without bound.** Every session keeps its full `diff_text`, and nothing prunes ended sessions or old `review_index` entries. Fine for a personal tool, will not stay fine forever.
+- **The interactive browser layer has no automated coverage.** The pure logic in `src/client/*.js` is unit-tested, but the glue that calls it — selection ranges, `TreeWalker` offsets, `intersectsNode`, scroll/flash, SSE wiring — only ever runs in a real browser. Changes there need hand-checking; the tests will not catch you.
 
 ## Conventions
 

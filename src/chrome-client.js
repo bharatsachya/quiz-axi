@@ -6,13 +6,36 @@
 import { escapeHtml } from "./client/text.js";
 import { createSubmitCoalescer } from "./client/submit-queue.js";
 import { TOUR_MUST_VISIT_KINDS, maxReachableTourIndex as computeMaxReachable, tourRailIcon as railIcon, tourRailKindClass } from "./client/tour.js";
+import { initTheme } from "./client/theme.js";
 import { endedOutcomeCopy, isTypingTarget } from "./client/ui-copy.js";
 
 const sessionDataElement = document.getElementById("quiz-session");
 const sessionData = JSON.parse(sessionDataElement?.textContent || "{}");
 const key = String(sessionData.key || "");
 const initialChat = Array.isArray(sessionData.initialChat) ? sessionData.initialChat : [];
+const initialThreads = sessionData.initialThreads && typeof sessionData.initialThreads === "object" ? sessionData.initialThreads : {};
 const tourSpecs = Array.isArray(sessionData.tour) ? sessionData.tour : [];
+
+// Reading the PROPERTY throws (not just its methods) when a browser blocks storage - some
+// privacy modes and third-party-context settings do exactly that. This is a module script, so
+// an uncaught throw here aborts the whole graph and takes chat, tour and answering with it.
+function safeLocalStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+// Wired first, before anything below can throw: a page that fails to set up its chat or tour is
+// still readable, but only if it is readable in the theme the reader asked for.
+initTheme({
+  root: document.documentElement,
+  storageKey: String(sessionData.themeStorageKey || "quiz-axi:theme"),
+  toggles: document.querySelectorAll("[data-theme-toggle]"),
+  prefersDark: () => window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches,
+  storage: safeLocalStorage(),
+});
 const queueStorageKey = "quiz-axi:queued:" + key;
 
 const panelScroll = document.getElementById("panelScroll");
@@ -168,12 +191,193 @@ function addChat(role, text, shouldScroll = true) {
   return el;
 }
 
-function syncChat(chat) {
-  for (const el of [...chatLog.querySelectorAll(".bubble.user,.bubble.agent:not(.agent-working)")]) {
+// ---------------------------------------------------------------------------
+// Highlight to ask: turn a text selection into an anchor, and let a thread point back at it.
+// ---------------------------------------------------------------------------
+
+let draftThread = null;
+
+function clearDraftThread() {
+  draftThread = null;
+  if (askChip) askChip.hidden = true;
+}
+
+function currentSelectionAnchor() {
+  const selection = window.getSelection?.();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  const node = range.commonAncestorContainer;
+  const el = node.nodeType === 1 ? node : node.parentElement;
+  if (!el) return null;
+  // Only the review itself is anchorable - a selection in the conversation panel or the ended
+  // overlay is someone copying text, not asking about the change.
+  if (!el.closest("#fullReview, #tourMode")) return null;
+
+  const hunkEl = el.closest(".diff-hunk-details");
+  if (hunkEl) return diffAnchorFromRange(range, hunkEl);
+
+  const blockEl = el.closest("[data-anchor-block]");
+  if (!blockEl) return null;
+  const blockText = blockEl.textContent || "";
+  const start = offsetWithin(blockEl, range.startContainer, range.startOffset);
+  const end = offsetWithin(blockEl, range.endContainer, range.endOffset);
+  if (start === null || end === null || end <= start) {
+    // The selection began or ended outside this block - it spans two of them. Anchoring to the
+    // whole first block beats refusing: the reader pointed at something real either way.
+    return buildBlockAnchor({
+      blockId: blockEl.dataset.anchorBlock,
+      blockKind: blockEl.dataset.anchorKind || "",
+      blockText,
+    });
+  }
+  return buildTextAnchor({
+    blockId: blockEl.dataset.anchorBlock,
+    blockKind: blockEl.dataset.anchorKind || "",
+    blockText,
+    start,
+    end,
+  });
+}
+
+// Character offset of a DOM position within `root`'s text, walking text nodes in order.
+// Returns null when the position is not inside root at all.
+function offsetWithin(root, container, offset) {
+  if (!root.contains(container)) return null;
+  let total = 0;
+  const walker = document.createTreeWalker(root, window.NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  while (node) {
+    if (node === container) return total + offset;
+    total += node.textContent.length;
+    node = walker.nextNode();
+  }
+  // The position is on an element rather than a text node (a caret between children).
+  return container === root ? total : null;
+}
+
+function diffAnchorFromRange(range, hunkEl) {
+  const fileEl = hunkEl.closest(".diff-file");
+  const file = fileEl?.querySelector(".diff-file-header")?.textContent?.trim() || "";
+  const cells = [];
+  for (const cell of hunkEl.querySelectorAll(".split-cell[data-ln]")) {
+    if (range.intersectsNode(cell)) cells.push({ side: cell.dataset.side, line: Number(cell.dataset.ln) });
+  }
+  // A selection reaching outside this hunk is clamped to it rather than split across hunks.
+  const spansHunks = !hunkEl.contains(range.startContainer) || !hunkEl.contains(range.endContainer);
+  return buildDiffAnchor({ hunkDomId: hunkEl.id, file, cells, spansHunks });
+}
+
+function startDraftThread(anchor) {
+  draftThread = { threadId: newThreadId(), anchor };
+  if (askChip) {
+    askChip.hidden = false;
+    askChipText.textContent = anchorLabel(anchor, 70);
+  }
+  hideAskButton();
+  chatInput.focus();
+}
+
+// getBoundingClientRect is viewport-relative; the button is position:absolute against the
+// page. Those coincide only because the page itself never scrolls - `.frame` is the scroll
+// container (chrome.css `overflow-y: auto`) and the body is fixed to the viewport height. The
+// scroll offsets below are therefore always 0 today, and are written out so that if the body
+// ever does scroll this keeps working instead of placing the button off-screen.
+function showAskButton(rect) {
+  if (!askButton) return;
+  askButton.hidden = false;
+  askButton.style.top = `${Math.max(8, rect.top + window.scrollY - 38)}px`;
+  askButton.style.left = `${Math.max(8, rect.left + window.scrollX)}px`;
+}
+
+function hideAskButton() {
+  if (askButton) askButton.hidden = true;
+}
+
+function onSelectionSettled() {
+  const anchor = currentSelectionAnchor();
+  if (!anchor) {
+    hideAskButton();
+    return;
+  }
+  const range = window.getSelection().getRangeAt(0);
+  pendingAnchor = anchor;
+  showAskButton(range.getBoundingClientRect());
+}
+
+// Scrolls to and flashes the passage a thread is about. The guided tour physically relocates
+// hunk and card nodes, and hides the full review, so where the node currently lives decides
+// what has to happen first - see anchorRevealPlan.
+function revealAnchor(anchor) {
+  const el = anchorElement(anchor);
+  const plan = anchorRevealPlan({
+    found: Boolean(el),
+    inFullReview: Boolean(el && fullReview && fullReview.contains(el)),
+    fullReviewHidden: Boolean(fullReview && fullReview.hidden),
+  });
+  if (plan.action === "none") return;
+  if (plan.action === "exit-tour-then-scroll") exitTourMode();
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.add("hunk-highlight");
+  setTimeout(() => el.classList.remove("hunk-highlight"), 1600);
+}
+
+function anchorElement(anchor) {
+  if (!anchor) return null;
+  if (anchor.kind === "diff") return anchor.hunk_dom_id ? document.getElementById(anchor.hunk_dom_id) : null;
+  if (!anchor.block_id) return null;
+  return document.querySelector(`[data-anchor-block="${CSS.escape(anchor.block_id)}"]`);
+}
+
+// Renders one thread: the passage it is about (click to jump), then its turns. The quote is
+// stored on the thread rather than re-read from the page, so it still reads correctly even
+// when the anchor has gone stale and there is nothing left to scroll to.
+function renderThread(item) {
+  const el = document.createElement("div");
+  el.className = "thread";
+  const anchor = item.thread.anchor;
+  const label = anchorLabel(anchor, 120);
+  if (label) {
+    const quote = document.createElement("button");
+    quote.type = "button";
+    quote.className = "thread-quote" + (anchor?.stale ? " thread-quote-stale" : "");
+    quote.textContent = label;
+    if (anchor?.stale) quote.title = "This passage has changed since the question was asked";
+    quote.addEventListener("click", () => revealAnchor(anchor));
+    el.appendChild(quote);
+  }
+  for (const turn of item.turns) {
+    const bubble = document.createElement("div");
+    bubble.className = "bubble " + (turn.role === "agent" ? "agent" : "user");
+    bubble.innerHTML = "<small>" + (turn.role === "agent" ? "Agent" : "You") + "</small><div>" + escapeHtml(turn.text) + "</div>";
+    el.appendChild(bubble);
+  }
+  const followUp = document.createElement("button");
+  followUp.type = "button";
+  followUp.className = "thread-followup";
+  followUp.textContent = "Ask a follow-up";
+  followUp.addEventListener("click", () => {
+    // Rejoining an existing thread, so the anchor is not resent - the thread already has one,
+    // and the server ignores a second anchor for a known thread anyway.
+    draftThread = { threadId: item.thread.id, anchor: null };
+    if (askChip) {
+      askChip.hidden = false;
+      askChipText.textContent = label || "this thread";
+    }
+    chatInput.focus();
+  });
+  el.appendChild(followUp);
+  chatLog.appendChild(el);
+  return el;
+}
+
+function syncChat(chat, threads) {
+  for (const el of [...chatLog.querySelectorAll(".bubble.user,.bubble.agent:not(.agent-working),.thread")]) {
     el.remove();
   }
   let lastChatBubble = null;
-  for (const item of chat) lastChatBubble = addChat(item.role, item.text, false) || lastChatBubble;
+  for (const item of buildChatView(chat, threads)) {
+    lastChatBubble = (item.type === "thread" ? renderThread(item) : addChat(item.entry.role, item.entry.text, false)) || lastChatBubble;
+  }
   if (workingBubble) {
     chatLog.appendChild(workingBubble);
     scrollElementIntoView(workingBubble);
@@ -220,10 +424,24 @@ function sendQueued(endAfter) {
   closeMenus();
   const text = chatInput.value.trim();
   if (text) {
-    queued.push({ uid: "", prompt: text, selector: "", tag: "message", text: "Question for the agent" });
+    // An anchored question carries the passage it is about all the way to the agent. `selector`
+    // stays "" - the structured `target` is the codebase's own precedent for this, and a string
+    // field could only encode the anchor by stringifying it.
+    const target = draftThread
+      ? { type: "message", thread_id: draftThread.threadId, ...(draftThread.anchor ? { anchor: draftThread.anchor } : {}) }
+      : null;
+    queued.push({
+      uid: "",
+      prompt: text,
+      selector: "",
+      tag: "message",
+      text: "Question for the agent",
+      ...(target ? { target } : {}),
+    });
     persistQueuedPrompts();
     addChat("user", text);
     chatInput.value = "";
+    clearDraftThread();
     render();
   }
   if (!queued.length) {
@@ -770,12 +988,28 @@ document.addEventListener("keydown", (event) => {
 });
 
 render();
-initialChat.forEach((item) => addChat(item.role, item.text));
+syncChat(initialChat, initialThreads);
 setAgentPresence("waiting");
 
+// Selection lands on mouseup and on keyboard selection; the click handler on the floating
+// button has to run before the button is hidden, so hiding happens on mousedown elsewhere.
+document.addEventListener("mouseup", () => setTimeout(onSelectionSettled, 0));
+document.addEventListener("keyup", (event) => {
+  if (event.shiftKey || event.key === "Escape") setTimeout(onSelectionSettled, 0);
+});
+askButton?.addEventListener("mousedown", (event) => event.preventDefault());
+askButton?.addEventListener("click", () => {
+  if (pendingAnchor) startDraftThread(pendingAnchor);
+});
+askChipClear?.addEventListener("click", clearDraftThread);
+
 const events = new EventSource("/events/" + key);
-events.addEventListener("agent-reply", (event) => addChat("agent", JSON.parse(event.data).text));
-events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
+// One event for all chat. The old agent-reply event carried a bare string with no indication
+// of what it answered, which is exactly how a reply ends up under the wrong question.
+events.addEventListener("chat-sync", (event) => {
+  const payload = JSON.parse(event.data);
+  syncChat(payload.chat || [], payload.threads || {});
+});
 events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
 events.addEventListener("grade-sync", (event) => applyGradeSync(JSON.parse(event.data)));
 events.addEventListener("ended", (event) => markSessionEnded(JSON.parse(event.data)));

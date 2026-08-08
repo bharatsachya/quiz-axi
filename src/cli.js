@@ -222,14 +222,14 @@ export function createReviewOutput({ diffKey: key, url, status, ungrounded = [] 
 }
 
 async function pollCommand(args) {
-  const key = firstPositionalArg(args, ["--agent-reply", "--timeout-ms"]);
+  const key = firstPositionalArg(args, ["--agent-reply", "--thread", "--timeout-ms"]);
   if (!key) {
     throw new AxiError("diff_key is required", "VALIDATION_ERROR", ["Run `quiz-axi poll <diff_key>`"]);
   }
   const baseUrl = await ensureServer();
   const agentReply = flagValue(args, "--agent-reply");
   if (agentReply) {
-    await postJson(`${baseUrl}/api/${key}/agent-reply`, { text: agentReply });
+    await postJson(`${baseUrl}/api/${key}/agent-reply`, { text: agentReply, thread_id: flagValue(args, "--thread") || "" });
   }
   const timeoutMs = flagValue(args, "--timeout-ms");
   const timeoutQuery = timeoutMs ? `&timeoutMs=${encodeURIComponent(timeoutMs)}` : "";
@@ -338,10 +338,31 @@ function createFeedbackNextStep(key, sessionEnded, endedBy, prompts, agent, outc
     );
   }
   if (hasQuestions) {
-    parts.push(
-      `The human asked something back (tag "message"). Reply with \`quiz-axi poll ${key} --agent-reply ` +
-        `"<message>"\` on your next poll.`,
-    );
+    // An anchored question names the passage that failed to teach, so the reply command is
+    // printed with the thread id already filled in - guessing it, or omitting it and letting
+    // the reply land loose, are both worse than being handed the exact string.
+    const threaded = prompts.filter((prompt) => prompt.tag === "message" && prompt.thread?.id);
+    if (threaded.length) {
+      const list = threaded
+        .map((prompt) => {
+          const quote = String(prompt.thread.quote || "").replace(/\s+/g, " ").trim();
+          const where = quote ? `about "${quote.length > 90 ? `${quote.slice(0, 89)}…` : quote}"` : "unanchored";
+          const stale = prompt.thread.anchor?.stale ? " (that passage has since changed)" : "";
+          return `\`quiz-axi poll ${key} --agent-reply "<message>" --thread ${prompt.thread.id}\` - ${where}${stale}`;
+        })
+        .join("; ");
+      parts.push(
+        `The human asked something back (tag "message"), anchored to a passage they were reading. Reply on your ` +
+          `next poll with ${list}. The passage is the signal: a question anchored to an explainer step means that ` +
+          `step failed to teach, and the fix belongs in the explainer on any re-review. Without --thread the reply ` +
+          `still arrives, just not attached to the thread.`,
+      );
+    } else {
+      parts.push(
+        `The human asked something back (tag "message"). Reply with \`quiz-axi poll ${key} --agent-reply ` +
+          `"<message>"\` on your next poll.`,
+      );
+    }
   }
   if (sessionEnded) {
     parts.push(
@@ -850,13 +871,13 @@ export function getCommandHelp(command, { agent = "generic" } = {}) {
 }
 
 function createTopLevelHelp({ agent = "generic" } = {}) {
-  return `quiz-axi - quiz-axi AXI\n\nUsage:\n  quiz-axi\n  quiz-axi review --quiz <quiz.json> [--base <ref>] [--no-open]\n  quiz-axi review --self-authored [--summary "..."]\n  quiz-axi poll <diff_key> [--agent-reply "..."]\n  quiz-axi grade <diff_key> --question <id> --verdict correct|incorrect [--feedback "..."]\n  quiz-axi grade <diff_key> --finish pass|fail [--summary "..."]\n  quiz-axi end <diff_key>\n  quiz-axi verify\n  quiz-axi stop\n  quiz-axi setup hooks\n  quiz-axi server\n\nNote: poll long-polls indefinitely by default until the human acts, staying silent while it waits - never kill it. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })}\n\n`;
+  return `quiz-axi - quiz-axi AXI\n\nUsage:\n  quiz-axi\n  quiz-axi review --quiz <quiz.json> [--base <ref>] [--no-open]\n  quiz-axi review --self-authored [--summary "..."]\n  quiz-axi poll <diff_key> [--agent-reply "..." [--thread <id>]]\n  quiz-axi grade <diff_key> --question <id> --verdict correct|incorrect [--feedback "..."]\n  quiz-axi grade <diff_key> --finish pass|fail [--summary "..."]\n  quiz-axi end <diff_key>\n  quiz-axi verify\n  quiz-axi stop\n  quiz-axi setup hooks\n  quiz-axi server\n\nNote: poll long-polls indefinitely by default until the human acts, staying silent while it waits - never kill it. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })}\n\n`;
 }
 
 function createCommandHelp({ agent = "generic" } = {}) {
   return {
     review: `Usage: quiz-axi review --quiz <quiz.json> [--base <ref>] [--no-open]\n       quiz-axi review --self-authored [--summary "..."] [--base <ref>]\n\nOpen a review session for the current diff (working tree vs. the resolved base branch: --base, QUIZ_AXI_BASE_BRANCH, @{upstream}, origin/HEAD, origin/main, or main, in that order). Untracked files are excluded - \`git add\` any new files first, or they will not appear in the reviewed diff and will not match what a later push sends. quiz.json describes questions about the diff; there is no answer key field, grading is always live via \`quiz-axi grade\`.\n\n--self-authored seals the diff as passed immediately with no quiz, no browser, no agent - meant for a human sealing a change they personally wrote. Agents should not run this themselves to skip a review.\n`,
-    poll: `Usage: quiz-axi poll <diff_key> [--agent-reply "..."]\n\nLong-polls indefinitely for a human answer, question, or session end. Stays silent while waiting - never kill it. ${pollExecutionGuidance({ agent })} Use --agent-reply to display your response before waiting again.\n`,
+    poll: `Usage: quiz-axi poll <diff_key> [--agent-reply "..." [--thread <id>]]\n\nLong-polls indefinitely for a human answer, question, or session end. Stays silent while waiting - never kill it. ${pollExecutionGuidance({ agent })} Use --agent-reply to display your response before waiting again, and --thread <id> to attach it to the question thread it answers (the id is printed in the poll output; omitting it files the reply loose).\n`,
     grade: `Usage: quiz-axi grade <diff_key> --question <id> --verdict correct|incorrect [--feedback "..."]\n       quiz-axi grade <diff_key> --finish pass|fail [--summary "..."]\n\nRecords a live verdict for one answered question, or seals the review record that \`quiz-axi verify\` checks.\n`,
     end: `Usage: quiz-axi end <diff_key>\n\nEnd a review session as the agent.\n`,
     verify: `Usage: quiz-axi verify [--to <sha>] [--base <ref>]\n\nThe husky pre-push gate. Reads the pre-push stdin protocol (or --to <sha> for a manual check of one commit, or defaults to the current working-tree diff) and checks the review record for each diff directly off disk - no server required. Every diff (review-time and push-time) is computed the same way: mergeBase(resolved base branch, commit) vs. commit, so re-pushing an already-reviewed branch with one more commit re-diffs against the same base 'review' used, not the remote's previous tip. Exits non-zero if any diff hasn't been reviewed and passed.\n`,
