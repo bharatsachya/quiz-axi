@@ -15,6 +15,31 @@ test("createReviewOutput tells the agent to poll next, not respond to the user",
   assert.match(output.next_step, /quiz-axi poll abc123/);
 });
 
+test("createReviewOutput stays silent about grounding when every anchor matched", () => {
+  const output = createReviewOutput({ diffKey: "abc123", url: "http://x/", status: "opened", ungrounded: [] });
+  assert.equal(output.review.grounding, undefined);
+  assert.match(output.next_step, /^Do not respond to the user just yet/);
+});
+
+test("createReviewOutput names ungrounded anchors and separates invented files from stale ranges", () => {
+  const output = createReviewOutput({
+    diffKey: "abc123",
+    url: "http://x/",
+    status: "opened",
+    ungrounded: [
+      { where: "explainer.walkthrough[0]", file: "src/nope.js", start_line: 1, end_line: 5, reason: "file-not-in-diff" },
+      { where: 'questions["q1"]', file: "src/quiz.js", start_line: 900, end_line: 901, reason: "no-matching-hunk" },
+    ],
+  });
+  assert.equal(output.review.grounding.ungrounded_anchors.length, 2);
+  assert.match(output.next_step, /2 hunk_anchor\(s\)/);
+  assert.match(output.next_step, /1 of them naming a file the changeset never touched/);
+  assert.match(output.next_step, /1 with a line range matching no hunk/);
+  // The poll instruction still has to survive the prefix - it is the only thing that keeps the
+  // agent from replying to the user and abandoning the review.
+  assert.match(output.next_step, /quiz-axi poll abc123/);
+});
+
 test("createPollOutput throws NOT_FOUND for a missing session", () => {
   assert.throws(() => createPollOutput({ diffKey: "abc", response: { status: "missing" } }), /No active quiz-axi review session/);
 });

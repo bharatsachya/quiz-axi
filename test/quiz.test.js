@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { validateQuizSpec } from "../src/quiz.js";
+import { collectUngroundedAnchors, validateQuizSpec } from "../src/quiz.js";
 
 const ONE_QUESTION = [{ id: "q1", type: "free-text", prompt: "Why?" }];
 
@@ -171,4 +171,73 @@ test("forward compat: an unrecognized version number still parses fields, with a
   assert.equal(spec.version, 7);
   assert.equal(spec.explainer.summary, "x");
   assert.match(spec.warnings.join(" "), /Unknown quiz\.json version 7/);
+});
+
+// The parsed-diff shape both callers hand collectUngroundedAnchors: src/quiz.js touched at
+// lines 1-40, src/server.js at 100-120. Nothing else is in this changeset.
+const PARSED_DIFF = [
+  { file: "src/quiz.js", hunks: [{ startLine: 1, endLine: 40 }] },
+  { file: "src/server.js", hunks: [{ startLine: 100, endLine: 120 }] },
+];
+
+test("grounding: anchors that overlap a real hunk are grounded, and no anchor is not a failure", () => {
+  const spec = {
+    explainer: {
+      summary: "x",
+      walkthrough: [
+        { text: "in range", hunk_anchor: { file: "src/quiz.js", start_line: 10, end_line: 20 } },
+        { text: "overlaps the hunk edge", hunk_anchor: { file: "src/server.js", start_line: 90, end_line: 101 } },
+        { text: "prose with nothing to point at", hunk_anchor: null },
+      ],
+    },
+    questions: [{ id: "q1", type: "free-text", prompt: "Why?", hunk_anchor: null }],
+  };
+  assert.deepEqual(collectUngroundedAnchors(spec, PARSED_DIFF), []);
+});
+
+test("grounding: an anchor naming a file the changeset never touched is reported as file-not-in-diff", () => {
+  const spec = {
+    explainer: {
+      summary: "x",
+      walkthrough: [{ text: "explains work that isn't here", hunk_anchor: { file: "src/nope.js", start_line: 1, end_line: 5 } }],
+    },
+    questions: [],
+  };
+  const ungrounded = collectUngroundedAnchors(spec, PARSED_DIFF);
+  assert.equal(ungrounded.length, 1);
+  assert.equal(ungrounded[0].reason, "file-not-in-diff");
+  assert.equal(ungrounded[0].where, "explainer.walkthrough[0]");
+  assert.equal(ungrounded[0].file, "src/nope.js");
+  assert.equal(ungrounded[0].label, "explains work that isn't here");
+});
+
+test("grounding: a real file whose line range matches no hunk is reported as no-matching-hunk", () => {
+  const spec = {
+    explainer: { summary: "x", walkthrough: [{ text: "stale lines", hunk_anchor: { file: "src/quiz.js", start_line: 500, end_line: 510 } }] },
+    questions: [],
+  };
+  const ungrounded = collectUngroundedAnchors(spec, PARSED_DIFF);
+  assert.equal(ungrounded.length, 1);
+  assert.equal(ungrounded[0].reason, "no-matching-hunk");
+});
+
+test("grounding: decisions and questions are checked too, not just the walkthrough", () => {
+  const spec = {
+    explainer: { summary: "x", walkthrough: [] },
+    decisions: [{ id: "d1", who: "agent", decision: "chose X", why: "", hunk_anchor: { file: "gone.js", start_line: 1, end_line: 2 } }],
+    questions: [{ id: "q1", type: "free-text", prompt: "Why?", hunk_anchor: { file: "src/quiz.js", start_line: 900, end_line: 901 } }],
+  };
+  const ungrounded = collectUngroundedAnchors(spec, PARSED_DIFF);
+  assert.deepEqual(
+    ungrounded.map((entry) => [entry.where, entry.reason]),
+    [
+      ['decisions["d1"]', "file-not-in-diff"],
+      ['questions["q1"]', "no-matching-hunk"],
+    ],
+  );
+});
+
+test("grounding: a v1 spec with no explainer and no decisions is checked without throwing", () => {
+  const spec = { questions: [{ id: "q1", type: "free-text", prompt: "Why?", hunk_anchor: { file: "src/quiz.js", start_line: 5, end_line: 6 } }] };
+  assert.deepEqual(collectUngroundedAnchors(spec, PARSED_DIFF), []);
 });

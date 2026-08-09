@@ -239,6 +239,53 @@ function normalizeHunkAnchor(anchor, label) {
   return { file, start_line: startLine, end_line: endLine };
 }
 
+// THE GROUNDING CHECK. Every place the agent may point at code - walkthrough steps, decisions
+// and questions - claims a hunk_anchor it did not compute; this is where those claims are
+// checked against the diff the *server* parsed, and where the ones that point at nothing are
+// counted. Unanchored claims are not failures (plenty of prose has nothing to point at); only
+// an anchor that was supplied and matches no real hunk is.
+//
+// Reported rather than dropped, unlike the equivalent gate this is modelled on: quiz-axi's
+// validator degrades rather than rejects, the prose is still worth reading, and the human has
+// the real diff open beside it. What matters is that the count is SHOWN - an explainer step
+// silently rendered without its hunk link looks exactly like one that was grounded, which is
+// the same "reviewed and found clean" ambiguity the uncovered-hunks stop already exists to
+// close, arriving from the other direction.
+//
+// `files` is the parsed diff - [{ file, hunks: [{ startLine, endLine }] }] - which both
+// `parseDiffHunks` (cli) and `parseDiffForDisplay` (server) produce, so neither caller has to
+// re-parse and the matching logic lives in exactly one place.
+export function collectUngroundedAnchors(spec, files) {
+  const byFile = new Map(files.map((entry) => [entry.file, entry.hunks]));
+  const ungrounded = [];
+  const check = (anchor, where, label) => {
+    if (!anchor) return;
+    const hunks = byFile.get(anchor.file);
+    // A file the changeset never touched means the agent explained a change that isn't here;
+    // a real file whose line range matches no hunk usually means the code moved after the
+    // anchor was written. Very different signals, so they are never collapsed into one.
+    if (!hunks) {
+      ungrounded.push({ where, label, ...anchor, reason: "file-not-in-diff" });
+      return;
+    }
+    const matched = hunks.some((hunk) => anchor.start_line <= hunk.endLine && anchor.end_line >= hunk.startLine);
+    if (!matched) {
+      ungrounded.push({ where, label, ...anchor, reason: "no-matching-hunk" });
+    }
+  };
+
+  for (const [index, step] of (spec.explainer?.walkthrough || []).entries()) {
+    check(step.hunk_anchor, `explainer.walkthrough[${index}]`, step.text);
+  }
+  for (const decision of spec.decisions || []) {
+    check(decision.hunk_anchor, `decisions["${decision.id}"]`, decision.decision);
+  }
+  for (const question of spec.questions || []) {
+    check(question.hunk_anchor, `questions["${question.id}"]`, question.prompt);
+  }
+  return ungrounded;
+}
+
 // Matches each question's hunk_anchor against the diff hunks *independently computed
 // server-side* (never the agent's own copy), so a card renders next to its real hunk. An
 // anchor that doesn't match any real hunk degrades to unanchored rather than erroring.
